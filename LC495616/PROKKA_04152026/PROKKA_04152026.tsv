@@ -1,0 +1,185 @@
+locus_tag	ftype	length_bp	gene	EC_number	COG	product
+BBJGKJEP_00001	CDS	210				hypothetical protein
+BBJGKJEP_00002	CDS	399				hypothetical protein
+BBJGKJEP_00003	CDS	1056				hypothetical protein
+BBJGKJEP_00004	CDS	354				hypothetical protein
+BBJGKJEP_00005	CDS	288				hypothetical protein
+BBJGKJEP_00006	CDS	819				hypothetical protein
+BBJGKJEP_00007	CDS	222				hypothetical protein
+BBJGKJEP_00008	CDS	267				hypothetical protein
+BBJGKJEP_00009	CDS	522				hypothetical protein
+BBJGKJEP_00010	CDS	687				IS6 family transposase IS1216E
+BBJGKJEP_00011	CDS	576	hin_1		COG1961	DNA-invertase hin
+BBJGKJEP_00012	CDS	1173				IS256 family transposase IS1542
+BBJGKJEP_00013	CDS	696	walR_1		COG0745	Transcriptional regulatory protein WalR
+BBJGKJEP_00014	CDS	1143	sasA_1	2.7.-.-		Adaptive-response sensory-kinase SasA
+BBJGKJEP_00015	CDS	969	vanH_1	1.1.1.-		D-specific alpha-keto acid dehydrogenase
+BBJGKJEP_00016	CDS	1032	vanA_1	6.1.2.1		Vancomycin/teicoplanin A-type resistance protein VanA
+BBJGKJEP_00017	CDS	609	vanX_1	3.4.13.22		D-alanyl-D-alanine dipeptidase
+BBJGKJEP_00018	CDS	687				IS6 family transposase IS1216E
+BBJGKJEP_00019	CDS	912	vanY_1	3.4.17.-		D-alanyl-D-alanine carboxypeptidase
+BBJGKJEP_00020	CDS	486				hypothetical protein
+BBJGKJEP_00021	CDS	330	cadC			Cadmium resistance transcriptional regulatory protein CadC
+BBJGKJEP_00022	CDS	330				hypothetical protein
+BBJGKJEP_00023	CDS	288				hypothetical protein
+BBJGKJEP_00024	CDS	564	hin_2		COG1961	DNA-invertase hin
+BBJGKJEP_00025	CDS	573	hisB	3.1.3.15		Histidine biosynthesis bifunctional protein HisB
+BBJGKJEP_00026	CDS	576				hypothetical protein
+BBJGKJEP_00027	CDS	753				IS21 family transposase ISBmu3
+BBJGKJEP_00028	CDS	1542				IS21 family transposase ISPpu7
+BBJGKJEP_00029	CDS	195				hypothetical protein
+BBJGKJEP_00030	CDS	465				hypothetical protein
+BBJGKJEP_00031	CDS	636	tagU	2.7.8.-	COG1316	Polyisoprenyl-teichoic acid--peptidoglycan teichoic acid transferase TagU
+BBJGKJEP_00032	CDS	687				IS6 family transposase IS1216E
+BBJGKJEP_00033	CDS	183				hypothetical protein
+BBJGKJEP_00034	CDS	285				hypothetical protein
+BBJGKJEP_00035	CDS	237				hypothetical protein
+BBJGKJEP_00036	CDS	255				hypothetical protein
+BBJGKJEP_00037	CDS	186				hypothetical protein
+BBJGKJEP_00038	CDS	396				hypothetical protein
+BBJGKJEP_00039	CDS	351				hypothetical protein
+BBJGKJEP_00040	CDS	375				hypothetical protein
+BBJGKJEP_00041	CDS	1149				IS200/IS605 family transposase ISEfa4
+BBJGKJEP_00042	CDS	405				hypothetical protein
+BBJGKJEP_00043	CDS	399				hypothetical protein
+BBJGKJEP_00044	CDS	768				hypothetical protein
+BBJGKJEP_00045	CDS	1161				hypothetical protein
+BBJGKJEP_00046	CDS	804				hypothetical protein
+BBJGKJEP_00047	CDS	456				hypothetical protein
+BBJGKJEP_00048	CDS	1059				hypothetical protein
+BBJGKJEP_00049	CDS	1950				hypothetical protein
+BBJGKJEP_00050	CDS	3690				hypothetical protein
+BBJGKJEP_00051	CDS	339				hypothetical protein
+BBJGKJEP_00052	CDS	330				hypothetical protein
+BBJGKJEP_00053	CDS	2166				hypothetical protein
+BBJGKJEP_00054	CDS	231				hypothetical protein
+BBJGKJEP_00055	CDS	867				hypothetical protein
+BBJGKJEP_00056	CDS	1959				hypothetical protein
+BBJGKJEP_00057	CDS	495				hypothetical protein
+BBJGKJEP_00058	CDS	1101				hypothetical protein
+BBJGKJEP_00059	CDS	336				hypothetical protein
+BBJGKJEP_00060	CDS	189				hypothetical protein
+BBJGKJEP_00061	CDS	327				hypothetical protein
+BBJGKJEP_00062	CDS	1596				hypothetical protein
+BBJGKJEP_00063	CDS	585				hypothetical protein
+BBJGKJEP_00064	CDS	252				hypothetical protein
+BBJGKJEP_00065	CDS	723				hypothetical protein
+BBJGKJEP_00066	CDS	744				hypothetical protein
+BBJGKJEP_00067	CDS	366				hypothetical protein
+BBJGKJEP_00068	CDS	531				hypothetical protein
+BBJGKJEP_00069	CDS	120				hypothetical protein
+BBJGKJEP_00070	CDS	366				hypothetical protein
+BBJGKJEP_00071	CDS	390				hypothetical protein
+BBJGKJEP_00072	CDS	225				hypothetical protein
+BBJGKJEP_00073	CDS	282				hypothetical protein
+BBJGKJEP_00074	CDS	243				hypothetical protein
+BBJGKJEP_00075	CDS	249				hypothetical protein
+BBJGKJEP_00076	CDS	213				hypothetical protein
+BBJGKJEP_00077	CDS	219				hypothetical protein
+BBJGKJEP_00078	CDS	288				hypothetical protein
+BBJGKJEP_00079	CDS	2241				hypothetical protein
+BBJGKJEP_00080	CDS	798				hypothetical protein
+BBJGKJEP_00081	CDS	183				hypothetical protein
+BBJGKJEP_00082	CDS	288				hypothetical protein
+BBJGKJEP_00083	CDS	288				hypothetical protein
+BBJGKJEP_00084	CDS	909				IS982 family transposase ISEfm1
+BBJGKJEP_00085	CDS	240				hypothetical protein
+BBJGKJEP_00086	CDS	330				hypothetical protein
+BBJGKJEP_00087	CDS	324				hypothetical protein
+BBJGKJEP_00088	CDS	687				IS6 family transposase IS1216E
+BBJGKJEP_00089	CDS	699	walR_2		COG0745	Transcriptional regulatory protein WalR
+BBJGKJEP_00090	CDS	1113	sasA_2	2.7.-.-		Adaptive-response sensory-kinase SasA
+BBJGKJEP_00091	CDS	864	vanY_2	3.4.17.-		D-alanyl-D-alanine carboxypeptidase
+BBJGKJEP_00092	CDS	969	vanH_2	1.1.1.-		D-specific alpha-keto acid dehydrogenase
+BBJGKJEP_00093	CDS	1032	vanA_2	6.1.2.1		Vancomycin/teicoplanin A-type resistance protein VanA
+BBJGKJEP_00094	CDS	609	vanX_2	3.4.13.22		D-alanyl-D-alanine dipeptidase
+BBJGKJEP_00095	CDS	687				IS6 family transposase IS1216E
+BBJGKJEP_00096	CDS	234				hypothetical protein
+BBJGKJEP_00097	CDS	405				hypothetical protein
+BBJGKJEP_00098	CDS	1149				IS200/IS605 family transposase ISEfa4
+BBJGKJEP_00099	CDS	480				hypothetical protein
+BBJGKJEP_00100	CDS	1374				hypothetical protein
+BBJGKJEP_00101	CDS	528				hypothetical protein
+BBJGKJEP_00102	CDS	564				hypothetical protein
+BBJGKJEP_00103	CDS	738				hypothetical protein
+BBJGKJEP_00104	CDS	417				hypothetical protein
+BBJGKJEP_00105	CDS	1242				hypothetical protein
+BBJGKJEP_00106	CDS	2391				hypothetical protein
+BBJGKJEP_00107	CDS	1836				hypothetical protein
+BBJGKJEP_00108	CDS	858				hypothetical protein
+BBJGKJEP_00109	CDS	1110				hypothetical protein
+BBJGKJEP_00110	CDS	801				hypothetical protein
+BBJGKJEP_00111	CDS	789				hypothetical protein
+BBJGKJEP_00112	CDS	870				hypothetical protein
+BBJGKJEP_00113	CDS	348				hypothetical protein
+BBJGKJEP_00114	CDS	1263				hypothetical protein
+BBJGKJEP_00115	CDS	1377				hypothetical protein
+BBJGKJEP_00116	CDS	630				hypothetical protein
+BBJGKJEP_00117	CDS	405				hypothetical protein
+BBJGKJEP_00118	CDS	1149				IS200/IS605 family transposase ISEfa4
+BBJGKJEP_00119	CDS	429				hypothetical protein
+BBJGKJEP_00120	CDS	522				hypothetical protein
+BBJGKJEP_00121	CDS	600				hypothetical protein
+BBJGKJEP_00122	CDS	477				hypothetical protein
+BBJGKJEP_00123	CDS	903				hypothetical protein
+BBJGKJEP_00124	CDS	195				hypothetical protein
+BBJGKJEP_00125	CDS	429				hypothetical protein
+BBJGKJEP_00126	CDS	588				hypothetical protein
+BBJGKJEP_00127	CDS	900				hypothetical protein
+BBJGKJEP_00128	CDS	915				hypothetical protein
+BBJGKJEP_00129	CDS	216				hypothetical protein
+BBJGKJEP_00130	CDS	255				hypothetical protein
+BBJGKJEP_00131	CDS	117				hypothetical protein
+BBJGKJEP_00132	CDS	1017				hypothetical protein
+BBJGKJEP_00133	CDS	231				hypothetical protein
+BBJGKJEP_00134	CDS	225				hypothetical protein
+BBJGKJEP_00135	CDS	876				hypothetical protein
+BBJGKJEP_00136	CDS	795				hypothetical protein
+BBJGKJEP_00137	CDS	1119				hypothetical protein
+BBJGKJEP_00138	CDS	321				hypothetical protein
+BBJGKJEP_00139	CDS	690				hypothetical protein
+BBJGKJEP_00140	CDS	204				hypothetical protein
+BBJGKJEP_00141	CDS	798				hypothetical protein
+BBJGKJEP_00142	CDS	687				IS6 family transposase IS1216E
+BBJGKJEP_00143	CDS	195				hypothetical protein
+BBJGKJEP_00144	CDS	1188				IS256 family transposase IS16
+BBJGKJEP_00145	CDS	687				IS6 family transposase IS1216E
+BBJGKJEP_00146	CDS	606		2.7.7.-	COG2184	Protein adenylyltransferase NmFic
+BBJGKJEP_00147	CDS	573	pinR	3.1.22.-	COG1961	Serine recombinase PinR
+BBJGKJEP_00148	CDS	375				IS3 family transposase ISBce13
+BBJGKJEP_00149	CDS	837				IS3 family transposase IS1485
+BBJGKJEP_00150	CDS	291				IS3 family transposase IS1485
+BBJGKJEP_00151	CDS	315	insK		COG2801	Putative transposase InsK for insertion sequence element IS150
+BBJGKJEP_00152	CDS	255				hypothetical protein
+BBJGKJEP_00153	CDS	276				hypothetical protein
+BBJGKJEP_00154	CDS	882				hypothetical protein
+BBJGKJEP_00155	CDS	687				IS6 family transposase IS1216E
+BBJGKJEP_00156	CDS	213				hypothetical protein
+BBJGKJEP_00157	CDS	225				hypothetical protein
+BBJGKJEP_00158	CDS	870				hypothetical protein
+BBJGKJEP_00159	CDS	735	COQ5	2.1.1.163		2-methoxy-6-polyprenyl-1,4-benzoquinol methylase, mitochondrial
+BBJGKJEP_00160	CDS	909	aadK	2.7.7.-		Aminoglycoside 6-adenylyltransferase
+BBJGKJEP_00161	CDS	249	satA	2.3.-.-		Streptothricin acetyltransferase A
+BBJGKJEP_00162	CDS	909				IS982 family transposase ISEfm1
+BBJGKJEP_00163	CDS	1296				ISL3 family transposase ISEfa11
+BBJGKJEP_00164	CDS	795	aphA	2.7.1.95		Aminoglycoside 3'-phosphotransferase
+BBJGKJEP_00165	CDS	1173				IS256 family transposase IS1542
+BBJGKJEP_00166	CDS	738	erm	2.1.1.184		rRNA adenine N-6-methyltransferase
+BBJGKJEP_00167	CDS	864		2.7.1.176		Toxin zeta
+BBJGKJEP_00168	CDS	273				Antitoxin epsilon
+BBJGKJEP_00169	CDS	210				hypothetical protein
+BBJGKJEP_00170	CDS	258				hypothetical protein
+BBJGKJEP_00171	CDS	687				IS6 family transposase IS1216E
+BBJGKJEP_00172	CDS	258				hypothetical protein
+BBJGKJEP_00173	CDS	222				hypothetical protein
+BBJGKJEP_00174	CDS	156				hypothetical protein
+BBJGKJEP_00175	CDS	552	repB			Replication protein RepB
+BBJGKJEP_00176	CDS	687				IS6 family transposase IS1216E
+BBJGKJEP_00177	CDS	531				hypothetical protein
+BBJGKJEP_00178	CDS	546				hypothetical protein
+BBJGKJEP_00179	CDS	567				hypothetical protein
+BBJGKJEP_00180	CDS	249				hypothetical protein
+BBJGKJEP_00181	CDS	240				hypothetical protein
+BBJGKJEP_00182	CDS	240				hypothetical protein
+BBJGKJEP_00183	CDS	282				hypothetical protein
+BBJGKJEP_00184	CDS	342				hypothetical protein
