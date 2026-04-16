@@ -1,0 +1,21 @@
+name: linear_plasmids_env
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+channel-priority: flexible
+dependencies:
+  # Python — 3.10 has the broadest bioconda package support on Linux
+  - python=3.10
+
+  # Python packages
+  - biopython
+  - numpy
+  - pandas
+  - pysam
+  - matplotlib
+
+  # External bioinformatics tools
+  - minimap2
+  - samtools
+  - blast              # optional: --blast-db (PLSDB homology search)
