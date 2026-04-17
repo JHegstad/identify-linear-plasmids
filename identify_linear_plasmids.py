@@ -1101,9 +1101,11 @@ def interpret_blast_hits(blast_df: pd.DataFrame) -> dict:
         "linear_plasmid", "telomere",
     ]
     # Tier 2: specific named linear plasmid families
+    # Use prefix anchors only (\bpelf not \bpelf\b) so variants like
+    # pELF_AA290 or pBSSB1 are matched despite the underscore/digit breaking \b.
     specific_keywords = [
-        r"\bpelf\b", r"\bpelf1\b", r"\bpelf2\b", r"\bpelf_usz\b",
-        r"\bpbssb\b",
+        r"\bpelf",
+        r"\bpbssb",
     ]
 
     titles_lower = blast_df["stitle"].str.lower().fillna("")
