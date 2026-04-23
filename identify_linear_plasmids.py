@@ -2209,6 +2209,7 @@ def main():
                                  or ev.get("blast", {}).get("linear_plasmid_hit", False),
             "blast_top_hit":     ev.get("blast", {}).get("top_hit", ""),
             "blast_identity":    ev.get("blast", {}).get("best_identity", ""),
+            "blast_coverage":   ev.get("blast", {}).get("best_coverage", ""),
             "gfa_topology":      ev.get("gfa_topology", {}).get("topology", ""),
             "gfa_linear":        ev.get("gfa_topology", {}).get("consistent_with_linear", ""),
             "copy_number":       ev.get("copy_number", {}).get("estimated_copy_number", ""),
