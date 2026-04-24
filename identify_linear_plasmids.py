@@ -979,26 +979,40 @@ def estimate_copy_number(bam_file: str, contig_id: str,
 # MODULE 7: ASSEMBLY GRAPH TOPOLOGY (GFA parsing)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def parse_gfa_topology(gfa_file: str) -> dict:
+def parse_gfa_topology(gfa_file: str, length_map: dict = None) -> dict:
     """
-    Parse a GFA assembly graph (Unicycler output) to detect linear contig
-    topology signatures (open ends, isolated contigs).
+    Parse a GFA assembly graph (Unicycler/Plassembler output) to detect linear
+    contig topology signatures (open ends, isolated contigs).
 
     Returns a dict: contig_id → topology_info.
+
+    length_map: optional {contig_id: seq_length} built from FASTA records.
+    When GFA segment names differ from FASTA contig IDs (e.g. Plassembler
+    uses numeric names like "1", "2", ...) segments are re-keyed by matching
+    their LN tag against the provided lengths. Ambiguous lengths are skipped.
     """
     if not gfa_file or not os.path.exists(gfa_file):
         return {}
 
     links = defaultdict(list)   # node → [(other_node, orientation)]
     segments = set()
+    seg_lengths = {}             # seg_name → int length
 
     with open(gfa_file) as fh:
         for line in fh:
             parts = line.strip().split("\t")
             if parts[0] == "S":
-                segments.add(parts[1])
+                seg = parts[1]
+                segments.add(seg)
+                seq = parts[2] if len(parts) > 2 else "*"
+                ln = len(seq) if seq != "*" else 0
+                for tag in parts[3:]:
+                    if tag.startswith("LN:i:"):
+                        ln = int(tag[5:])
+                        break
+                if ln:
+                    seg_lengths[seg] = ln
             elif parts[0] == "L":
-                # L from_seg from_orient to_seg to_orient overlap
                 if len(parts) >= 5:
                     src, src_o, dst, dst_o = parts[1], parts[2], parts[3], parts[4]
                     links[src].append((dst, src_o, dst_o))
@@ -1013,15 +1027,32 @@ def parse_gfa_topology(gfa_file: str) -> dict:
         elif n_links == 1:
             topology[seg] = "linear_end"
         elif n_links == 2:
-            # Check if both ends connect to same partner → TIR contig
             partners = {c[0] for c in connected}
             if len(partners) == 1:
                 topology[seg] = "tir_like"
             else:
                 topology[seg] = "linear_middle_or_circular"
         else:
-            # Multiple connections — complex / branching
             topology[seg] = "complex"
+
+    if length_map:
+        # Build inverse: length → contig_id, skipping any ambiguous lengths
+        len_to_ctg: dict = {}
+        for ctg_id, ctg_len in length_map.items():
+            if ctg_len in len_to_ctg:
+                len_to_ctg[ctg_len] = None  # collision — mark ambiguous
+            else:
+                len_to_ctg[ctg_len] = ctg_id
+
+        remapped = {}
+        for seg, topo in topology.items():
+            if seg in length_map:
+                remapped[seg] = topo          # name already matches a contig ID
+            else:
+                ln = seg_lengths.get(seg)
+                ctg_id = len_to_ctg.get(ln) if ln else None
+                remapped[ctg_id if ctg_id else seg] = topo
+        topology = remapped
 
     return topology
 
@@ -2110,8 +2141,10 @@ def main():
     if not annot_df.empty:
         print(f"[INFO] Loaded annotation: {len(annot_df)} features")
 
-    # Parse GFA
-    gfa_topology = parse_gfa_topology(args.gfa) if args.gfa else {}
+    # Parse GFA — pass length map so numeric Plassembler segment names are
+    # remapped to FASTA contig IDs via sequence-length matching.
+    length_map = {r.id: len(r.seq) for r in records}
+    gfa_topology = parse_gfa_topology(args.gfa, length_map) if args.gfa else {}
     if gfa_topology:
         print(f"[INFO] Loaded GFA topology: {len(gfa_topology)} segments")
 
