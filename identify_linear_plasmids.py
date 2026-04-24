@@ -1234,13 +1234,14 @@ def compute_score(evidence: dict) -> dict:
         score += SCORING_WEIGHTS["gc_deviation"]
         breakdown["gc_deviation"] = SCORING_WEIGHTS["gc_deviation"]
 
-    # 5. Gene-based scoring — BLOCKED for confirmed-circular contigs.
-    # When circular=true is in the header the annotation likely reflects genes
-    # shared across all contigs (Prokka TSV fallback), making gene signals
-    # unreliable. Structural evidence above is still valid.
+    # 5. Gene-based scoring.
+    # Suppressed only when annotation could not be matched to this contig
+    # (Prokka-TSV fallback: all genes smeared across all contigs). A circular
+    # flag alone does not make gene evidence unreliable when the annotation is
+    # a properly-matched GFF3 with per-contig features.
     genes = evidence.get("genes", {})
-    if is_confirmed_circular and CIRCULAR_DISQUALIFIES_GENE_SCORING:
-        genes = {}   # suppress all gene scoring for this contig
+    if genes.get("_annotation_mismatch"):
+        genes = {}   # suppress gene scoring — annotation not contig-specific
 
     if genes.get("partition_genes"):
         score += SCORING_WEIGHTS["par_system"]
