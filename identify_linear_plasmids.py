@@ -171,6 +171,8 @@ SCORING_WEIGHTS = {
     "is1216e_flanking":          8,   # IS1216E flanking resistance gene (Hashimoto 2019 vanM)
     "blast_hit":                15,   # BLAST hit to known linear plasmid db (PLSDB etc.)
     "blast_hit_linear_db":      20,   # BLAST hit explicitly to a *linear* plasmid sequence
+    "skani_hit":                15,   # SKANI hit to known linear plasmid db
+    "skani_hit_linear_db":      20,   # SKANI hit explicitly to a *linear* plasmid sequence
     "plasmid_finder_no_hit":     8,   # No PlasmidFinder hit (novel rep = typical of linear, H.2019)
     "coverage_drop_ends":       10,   # Coverage drop at contig ends (hairpin inaccessibility, Hashimoto 2019)
     "assembly_graph_linear":    15,   # Assembly graph linear topology
@@ -1161,6 +1163,52 @@ def interpret_blast_hits(blast_df: pd.DataFrame) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# MODULE 8b: SKANI-BASED DETECTION
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run_skani(query_fasta: str, db: str, out_file: str,
+              min_ani: float = 90.0, min_af: float = 0.05,
+              n_results: int = 5) -> pd.DataFrame:
+    """Run skani against a plasmid database and return a normalised DataFrame.
+
+    db may be a pre-sketched directory (uses `skani search`) or a FASTA file
+    (uses `skani dist`).  For large multi-sequence FASTA databases, pre-sketch
+    first: skani sketch -l db.fna -o db_dir/
+
+    Returns columns matching interpret_blast_hits expectations:
+    pident (ANI %), qcovs (align_fraction_query * 100), stitle (ref basename).
+    """
+    if not db or not os.path.exists(query_fasta):
+        return pd.DataFrame()
+
+    if os.path.isdir(db):
+        cmd = ["skani", "search", "-d", db, "-q", query_fasta,
+               "-o", out_file, "-n", str(n_results)]
+    else:
+        cmd = ["skani", "dist", query_fasta, db, "-o", out_file]
+
+    try:
+        subprocess.run(cmd, check=True, capture_output=True)
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return pd.DataFrame()
+
+    if not os.path.exists(out_file) or os.path.getsize(out_file) == 0:
+        return pd.DataFrame()
+
+    try:
+        df = pd.read_csv(out_file, sep="\t")
+        df["pident"] = df["ANI"]
+        df["qcovs"]  = df["Align_fraction_query"] * 100
+        df["stitle"] = df["Ref_file"].apply(
+            lambda p: os.path.splitext(os.path.basename(p))[0]
+        )
+        df = df[(df["pident"] >= min_ani) & (df["qcovs"] >= min_af * 100)]
+        return df.sort_values("pident", ascending=False).reset_index(drop=True)
+    except Exception:
+        return pd.DataFrame()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # MODULE 9: COMPOSITE SCORING
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1289,7 +1337,16 @@ def compute_score(evidence: dict) -> dict:
         score += SCORING_WEIGHTS["blast_hit"]
         breakdown["blast_hit"] = SCORING_WEIGHTS["blast_hit"]
 
-    # 9b. PlasmidFinder no-hit (novel rep = typical of linear plasmids, Hashimoto 2019)
+    # 9b. SKANI — two tiers (independent of BLAST; same weights for comparison)
+    skani = evidence.get("skani", {})
+    if skani.get("linear_plasmid_db_hit"):
+        score += SCORING_WEIGHTS["skani_hit_linear_db"]
+        breakdown["skani_hit_linear_db"] = SCORING_WEIGHTS["skani_hit_linear_db"]
+    elif skani.get("linear_plasmid_hit"):
+        score += SCORING_WEIGHTS["skani_hit"]
+        breakdown["skani_hit"] = SCORING_WEIGHTS["skani_hit"]
+
+    # 9c. PlasmidFinder no-hit (novel rep = typical of linear plasmids, Hashimoto 2019)
     if evidence.get("plasmid_finder_no_hit"):
         score += SCORING_WEIGHTS["plasmid_finder_no_hit"]
         breakdown["plasmid_finder_no_hit"] = SCORING_WEIGHTS["plasmid_finder_no_hit"]
@@ -2010,6 +2067,18 @@ def analyse_contig(record, args, annot_df, gfa_topology, ref_gc=None,
     else:
         evidence["blast"] = {"hits": 0, "linear_plasmid_hit": False}
 
+    # SKANI
+    if args.skani_db:
+        tmp_fa   = f"/tmp/{cid}_query.fa"
+        tmp_out  = f"/tmp/{cid}_skani.tsv"
+        with open(tmp_fa, "w") as fh:
+            fh.write(f">{cid}\n{seq}\n")
+        skani_df = run_skani(tmp_fa, args.skani_db, tmp_out,
+                             min_ani=args.skani_ani, min_af=args.skani_af)
+        evidence["skani"] = interpret_blast_hits(skani_df)
+    else:
+        evidence["skani"] = {"hits": 0, "linear_plasmid_hit": False}
+
     # Composite score
     evidence["score"] = compute_score(evidence)
 
@@ -2058,6 +2127,14 @@ def main():
     parser.add_argument("--blast-db",      help="BLAST database path (e.g. PLSDB)")
     parser.add_argument("--blast-identity", type=float, default=70.0,
                         help="Minimum BLAST %%identity (default: 70)")
+    parser.add_argument("--skani-db",
+                        help="SKANI database: pre-sketched directory or FASTA file. "
+                             "For large FASTA DBs, pre-sketch with: "
+                             "skani sketch -l db.fna -o db_dir/")
+    parser.add_argument("--skani-ani", type=float, default=90.0,
+                        help="Minimum SKANI ANI %%%% (default: 90)")
+    parser.add_argument("--skani-af",  type=float, default=0.05,
+                        help="Minimum SKANI query alignment fraction (default: 0.05)")
     parser.add_argument("--chromosome-contigs", nargs="*", default=[],
                         help="Contig IDs of chromosome (for copy number normalisation)")
     parser.add_argument("--ref-gc", type=float, default=None,
@@ -2243,7 +2320,12 @@ def main():
                                  or ev.get("blast", {}).get("linear_plasmid_hit", False),
             "blast_top_hit":     ev.get("blast", {}).get("top_hit", ""),
             "blast_identity":    ev.get("blast", {}).get("best_identity", ""),
-            "blast_coverage":   ev.get("blast", {}).get("best_coverage", ""),
+            "blast_coverage":    ev.get("blast", {}).get("best_coverage", ""),
+            "skani_hit":         ev.get("skani", {}).get("linear_plasmid_db_hit", False)
+                                 or ev.get("skani", {}).get("linear_plasmid_hit", False),
+            "skani_top_hit":     ev.get("skani", {}).get("top_hit", ""),
+            "skani_identity":    ev.get("skani", {}).get("best_identity", ""),
+            "skani_coverage":    ev.get("skani", {}).get("best_coverage", ""),
             "gfa_topology":      ev.get("gfa_topology", {}).get("topology", ""),
             "gfa_linear":        ev.get("gfa_topology", {}).get("consistent_with_linear", ""),
             "copy_number":       ev.get("copy_number", {}).get("estimated_copy_number", ""),
