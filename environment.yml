@@ -19,3 +19,4 @@ dependencies:
   - minimap2
   - samtools
   - blast              # optional: --blast-db (PLSDB homology search)
+  - skani              # optional: --skani-db (ANI-based plasmid DB search)

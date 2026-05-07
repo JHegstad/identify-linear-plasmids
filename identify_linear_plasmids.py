@@ -1198,10 +1198,18 @@ def run_skani(query_fasta: str, db: str, out_file: str,
     try:
         df = pd.read_csv(out_file, sep="\t")
         df["pident"] = df["ANI"]
-        df["qcovs"]  = df["Align_fraction_query"] * 100
-        df["stitle"] = df["Ref_file"].apply(
-            lambda p: os.path.splitext(os.path.basename(p))[0]
-        )
+        # Align_fraction_query is already in percent in skani ≥0.3
+        df["qcovs"]  = df["Align_fraction_query"]
+        # Prefer the full sequence header (Ref_name) for keyword matching;
+        # fall back to the filename stem if the column is absent (older skani)
+        if "Ref_name" in df.columns:
+            df["stitle"] = df["Ref_name"].fillna(
+                df["Ref_file"].apply(lambda p: os.path.splitext(os.path.basename(p))[0])
+            )
+        else:
+            df["stitle"] = df["Ref_file"].apply(
+                lambda p: os.path.splitext(os.path.basename(p))[0]
+            )
         df = df[(df["pident"] >= min_ani) & (df["qcovs"] >= min_af * 100)]
         return df.sort_values("pident", ascending=False).reset_index(drop=True)
     except Exception:
