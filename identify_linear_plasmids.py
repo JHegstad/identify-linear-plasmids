@@ -166,9 +166,9 @@ SCORING_WEIGHTS = {
     "repb_rep2":                 8,   # repB/Rep_2 superfamily replication gene (Hashimoto 2019)
     "ftsK_parA_repB_combo":     12,   # ftsK + parA + repB co-occurrence (pELF1 signature)
     "tas_system":                8,   # Toxin-antitoxin system
-    "resistance_genes":          5,   # Known AMR genes (context support)
+
     "is_elements":               5,   # IS elements associated with linear plasmids
-    "is1216e_flanking":          8,   # IS1216E flanking resistance gene (Hashimoto 2019 vanM)
+
     "blast_hit":                15,   # BLAST hit to known linear plasmid db (PLSDB etc.)
     "blast_hit_linear_db":      20,   # BLAST hit explicitly to a *linear* plasmid sequence
     "skani_hit":                15,   # SKANI hit to known linear plasmid db
@@ -189,8 +189,7 @@ SCORING_WEIGHTS = {
 # These are zeroed out when annotation falls back to assembly-wide features.
 CONTIG_SPECIFIC_SCORES = {
     "par_system", "repb_rep2", "ftsK_parA_repB_combo", "tas_system",
-    "resistance_genes", "is_elements", "is1216e_flanking",
-    "enterococcal_markers", "invertron_tp_gene",
+    "is_elements", "enterococcal_markers", "invertron_tp_gene",
 }
 
 # Contigs with circular=true in header are disqualified from gene-based scoring.
@@ -1319,20 +1318,10 @@ def compute_score(evidence: dict) -> dict:
         score += SCORING_WEIGHTS["tas_system"]
         breakdown["tas_system"] = SCORING_WEIGHTS["tas_system"]
 
-    # 7. Resistance genes
-    if genes.get("resistance_genes"):
-        score += SCORING_WEIGHTS["resistance_genes"]
-        breakdown["resistance_genes"] = SCORING_WEIGHTS["resistance_genes"]
-
-    # 8. IS elements
+    # 7. IS elements
     if genes.get("is_elements"):
         score += SCORING_WEIGHTS["is_elements"]
         breakdown["is_elements"] = SCORING_WEIGHTS["is_elements"]
-
-    # 8b. IS1216E flanking resistance gene cluster (Hashimoto 2019 vanM structure)
-    if len(genes.get("is1216_variants", [])) >= 1:
-        score += SCORING_WEIGHTS["is1216e_flanking"]
-        breakdown["is1216e_flanking"] = SCORING_WEIGHTS["is1216e_flanking"]
 
     # 9. BLAST — two tiers
     blast = evidence.get("blast", {})
