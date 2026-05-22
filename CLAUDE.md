@@ -41,6 +41,7 @@ With all optional inputs:
 python identify_linear_plasmids.py -i assembly.fasta \
     --bam reads.bam --gfa assembly.gfa \
     --annot prokka.gff --blast-db plsdb.fasta \
+    --skani-db skani_db/sketches \
     --ref-gc 37.5 --chromosome-contigs chr1 \
     --json
 ```
@@ -53,8 +54,8 @@ python identify_linear_plasmids.py \
     -i LC495616/LC495616.1.fasta \
     --bam LC495616/linear_plasmid_report.sorted.bam \
     --annot LC495616/PROKKA_04152026/PROKKA_04152026.gff \
-    --gfa LC495616/LC495616.1.gff3 \
-    --json --visualize -o LC495616/linear_plasmid_report
+    --skani-db skani_db/sketches \
+    --json -o LC495616/linear_plasmid_report
 ```
 
 ## Architecture
@@ -65,9 +66,7 @@ Single-file script (`identify_linear_plasmids.py`) with a modular pipeline:
 |--------|-------------|---------|
 | 0 | `parse_fasta_header`, `assess_header_metadata` | Extract circular/copy-number metadata from assembler FASTA headers (Unicycler, Plassembler, Hybracter) |
 | 2 | `detect_self_complement_ends` | Detect hairpin/palindromic ends via end-window reverse-complement identity |
-| 2b | `detect_idr_tata` | Find pELF1-type ~5 kb Inverted Direct Repeats flanking a TATA loop; also detects `tata_at_terminus` (assembler stopped at palindrome centre) |
 | 2c | `detect_coverage_drop_ends` | Detect coverage drop at contig ends via BAM (hairpin inaccessibility artefact) |
-| 2d | `detect_idr_in_reads` | Scan raw long reads mapping near contig ends for full arm1–TATA–arm2 palindrome |
 | 3 | `gc_content`, `assess_gc` | GC% deviation from reference |
 | 4 | `classify_size` | Size range check against known linear plasmid families |
 | 5 | `parse_annotation`, `screen_genes` | Screen GFF3/Prokka TSV for linear-plasmid-associated gene keywords |
@@ -80,4 +79,4 @@ Single-file script (`identify_linear_plasmids.py`) with a modular pipeline:
 
 **Annotation handling**: `screen_genes` tries to match the contig ID against the annotation's `contig` column. For multi-contig annotations with no match (Prokka TSV prefix ≠ FASTA header), gene scoring is skipped — use GFF3 (`--annot`) for reliable per-contig mapping.
 
-**Outputs**: `<prefix>.tsv` always; `<prefix>.json` with `--json`; `<prefix>.sorted.bam` when `--longread-fastq` triggers auto-mapping; `<prefix>_left_end_<contig>.png` per IDR/TATA-positive contig with `--visualize` (requires `matplotlib`).
+**Outputs**: `<prefix>.tsv` always; `<prefix>.json` with `--json`; `<prefix>.sorted.bam` when `--longread-fastq` triggers auto-mapping.
