@@ -354,9 +354,16 @@ def detect_asymmetric_ends(sc_result: dict,
 def detect_coverage_drop_ends(bam_file: str, contig_id: str,
                                contig_len: int, end_window: int = 5000) -> dict:
     """
-    Hairpin structures at linear plasmid ends reduce Illumina short-read coverage
-    because the hairpin fold prevents adapter ligation and PCR amplification
-    (Hashimoto 2019, Fig 3A).
+    Detect coverage drop at contig ends, consistent with linear plasmid terminal structure.
+
+    With Illumina reads: hairpin ends prevent adapter ligation and PCR amplification,
+    causing a sharp drop to near-zero at the terminal region (Hashimoto 2019, Fig 3A).
+    This is the most specific signal.
+
+    With long reads (ONT/PacBio): reads can span hairpin loops, so a drop is not
+    guaranteed by the same mechanism. A drop may still occur due to assembly truncation
+    at the terminus or reduced mappability of the terminal palindromic sequence, but
+    is less specific than with Illumina.
 
     Detects: mean depth in terminal <end_window> bp < 50% of plasmid body depth.
     """
