@@ -66,17 +66,6 @@ SIZE_RANGES = {
     "general":            (10_000, 500_000),  # permissive catch-all
 }
 
-# Hairpin central motif (Boumamoud 2022 / Hashimoto 2019)
-# pELF1 left end: ~5 kb inverted tandem repeats interspaced by 5'-TATA-3'
-HAIRPIN_CENTRAL_MOTIF = "TATA"
-HAIRPIN_IDR_WINDOW    = 5_000   # bp; inverted direct repeat flanking the TATA loop (Hashimoto 2019)
-HAIRPIN_IDR_MIN_LEN   = 100     # minimum IDR arm length to count as evidence
-
-# Terminal TATA window: if TATA is within this many bp of the contig start/end,
-# treat it as "tata_at_terminus" — the assembler stopped at the palindrome centre
-# (Hashimoto 2019, Fig 3A: coverage drops to zero at the hairpin tip).
-TATA_TERMINUS_WINDOW = 10   # bp from contig end to still count as terminal TATA
-
 # Invertron end parameters (Hashimoto 2019)
 # Terminal proteins (TPs) covalently bound at 5' end — detected by:
 #   lambda exonuclease resistance / exonuclease III sensitivity (wet lab only)
@@ -155,9 +144,6 @@ LINEAR_PLASMID_IS = [
 # Scoring weights for each evidence category (Hashimoto 2019 / Boumamoud 2022 / Hashimoto 2023)
 SCORING_WEIGHTS = {
     "hairpin_end":              20,   # Hairpin/palindromic end structure
-    "idr_tata_detected":        18,   # Inverted Direct Repeat + TATA loop (Hashimoto 2019 pELF1)
-    "tata_at_terminus":         15,   # TATA at contig tip = assembler stopped at palindrome centre
-    "idr_in_reads":             22,   # Full arm1—TATA—arm2 palindrome found in a raw long read
     "asymmetric_ends":          15,   # One hairpin + one invertron end (pELF1-type, Hashimoto 2019)
     "invertron_tp_gene":        12,   # Terminal protein gene present (invertron end)
     "size_range":               10,   # Size consistent with known linear plasmids
@@ -320,9 +306,6 @@ def detect_self_complement_ends(seq: str, window: int = 500, min_match: int = 40
     """
     Check whether the terminal window of a sequence contains self-complementary
     structure (inverted duplication / hairpin telomere).
-
-    pELF plasmids have 5'-TATA-3' at the centre of the hairpin (Boumamoud 2022 /
-    Hashimoto 2019). This function checks for a shorter diagnostic window.
     """
     if len(seq) < 2 * window:
         return {"found": False, "score": 0}
@@ -331,156 +314,27 @@ def detect_self_complement_ends(seq: str, window: int = 500, min_match: int = 40
     right = seq[-window:].upper()
     rc_right = str(Seq(right).reverse_complement())
 
-    # Count matching positions
     matches = sum(1 for a, b in zip(left, rc_right) if a == b)
     identity = matches / window
-
-    # Check for TATA motif very close to the ends (within 30 bp of start/end)
-    # Requiring proximity avoids false positives from random TATA occurrences
-    tata_left  = HAIRPIN_CENTRAL_MOTIF in left[:30]
-    tata_right = HAIRPIN_CENTRAL_MOTIF in right[-30:]
 
     return {
         "found": identity >= 0.70,   # 70 % identity threshold for hairpin evidence
         "identity": round(identity, 3),
-        "tata_motif_left":  tata_left,
-        "tata_motif_right": tata_right,
         "score": round(identity * 100, 1),
     }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# MODULE 2b: INVERTED DIRECT REPEAT (IDR) + TATA LOOP DETECTION  (Hashimoto 2019)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def detect_idr_tata(seq: str, window: int = 15_000, min_arm: int = 500,
-                    identity_threshold: float = 0.75) -> dict:
-    """
-    Detect ~5 kb Inverted Direct Repeats (IDRs) interspaced by a 5'-TATA-3' motif
-    at the left end of pELF1-type plasmids (Hashimoto 2019, Fig 3).
-
-    Structure (Hashimoto 2019 Fig 3A):
-        [→ IDR_arm_1 (~5 kb)] [TATA] [← IDR_arm_2 (~5 kb) = rc(IDR_arm_1)]
-
-    The two arms are "completely identical inverted direct repeats" — arm2 is the
-    reverse complement of arm1 and they point toward each other (converging arrows
-    in Fig 3A).  The TATA tetranucleotide sits at the centre of the palindrome.
-
-    Because "TATA" is a common tetranucleotide, the naive approach of taking the
-    first occurrence gives a trivially short arm.  Instead this function:
-      1. Examines the first (and last) <window> bp (default 15 kb to cover 2×5 kb arms).
-      2. Iterates over ALL TATA positions in that region.
-      3. For each candidate, computes arm identity = fraction matching between
-         rc(arm1) and arm2 of the same length.
-      4. Returns the candidate with the longest arm that meets the identity threshold.
-
-    Parameters
-    ----------
-    window           : bp to examine at each end (default 15 000)
-    min_arm          : minimum IDR arm length to consider (default 500 bp)
-    identity_threshold: minimum fraction identity to call a match (default 0.75)
-
-    Returns dict: found, arm_length, tata_position, identity, end (left/right/both).
-    """
-    motif     = HAIRPIN_CENTRAL_MOTIF          # "TATA"
-    motif_len = len(motif)
-
-    def _best_idr_in_region(region: str) -> dict:
-        """
-        Try every TATA occurrence; return the best (longest arm, ≥ identity_threshold).
-
-        Two detection modes:
-          A. Full IDR: arm1 (before TATA) vs rc(arm2) (after TATA), both ≥ min_arm bp.
-             This is the ideal case when the whole palindrome is assembled.
-          B. Terminal TATA: TATA is within TATA_TERMINUS_WINDOW bp of the region start.
-             This happens when the assembler stopped at the palindrome centre — the
-             mirror arm before the TATA was never sequenced (coverage drops to zero
-             at the hairpin tip, Hashimoto 2019 Fig 3A).  Reported separately so it
-             can be scored even without a full arm comparison.
-        """
-        best = {"found": False, "arm_length": 0, "identity": 0.0, "tata_pos": -1,
-                "tata_at_terminus": False}
-
-        # Mode B: check whether TATA is right at the contig tip
-        first_tata = region.find(motif)
-        if 0 <= first_tata <= TATA_TERMINUS_WINDOW:
-            best["tata_at_terminus"] = True
-            best["tata_pos"]         = first_tata
-            # Still try Mode A from this position (arm_len = first_tata, likely 0-10 bp,
-            # so will fail min_arm — that's expected; terminus flag carries the evidence)
-
-        # Mode A: full palindrome search over all TATA positions
-        start = 0
-        while True:
-            pos = region.find(motif, start)
-            if pos == -1:
-                break
-            start = pos + 1
-
-            arm_len = pos            # arm1 = region[:pos]
-            if arm_len < min_arm:
-                continue
-
-            arm2_start = pos + motif_len
-            arm2_end   = arm2_start + arm_len
-            if arm2_end > len(region):
-                continue
-
-            arm1    = region[:arm_len]
-            arm2    = region[arm2_start:arm2_end]
-            rc_arm1 = str(Seq(arm1).reverse_complement())
-
-            matches  = sum(1 for a, b in zip(rc_arm1, arm2) if a == b)
-            identity = matches / arm_len
-
-            if identity >= identity_threshold and arm_len > best["arm_length"]:
-                best.update({
-                    "found":      True,
-                    "arm_length": arm_len,
-                    "identity":   round(identity, 4),
-                    "tata_pos":   pos,
-                })
-
-        return best
-
-    n      = len(seq)
-    chk    = min(window, n // 2)
-    left_r  = seq[:chk].upper()
-    right_r = seq[max(0, n - chk):].upper()
-
-    left_result  = _best_idr_in_region(left_r)
-    right_result = _best_idr_in_region(right_r)
-
-    results    = {"left": left_result, "right": right_result}
-    found_ends    = [e for e, r in results.items() if r["found"]]
-    terminus_ends = [e for e, r in results.items() if r.get("tata_at_terminus")]
-
-    # Best-arm summary across both ends (for scoring)
-    best_arm = max((r["arm_length"] for r in results.values() if r["found"]),
-                   default=0)
-
-    return {
-        "found":            len(found_ends) > 0,
-        "found_ends":       found_ends,
-        "best_arm_bp":      best_arm,
-        # Terminal TATA: assembler stopped at palindrome centre; no arm comparison possible
-        "tata_at_terminus": len(terminus_ends) > 0,
-        "terminus_ends":    terminus_ends,
-        "details":          results,
-    }
-
-
-def detect_asymmetric_ends(sc_result: dict, idr_result: dict,
+def detect_asymmetric_ends(sc_result: dict,
                            gene_hits: dict) -> dict:
     """
     pELF1 has ASYMMETRIC ends: left = hairpin, right = invertron (terminal protein).
     This is a unique indicator of the pELF lineage (Hashimoto 2019).
 
     Detects asymmetry when:
-      - one end shows IDR/TATA structure AND
+      - one end shows self-complementary hairpin structure AND
       - terminal protein gene is annotated
     """
-    has_hairpin = idr_result.get("found") or sc_result.get("found")
+    has_hairpin = sc_result.get("found")
     has_tp_gene = bool(gene_hits.get("terminal_protein_genes"))
 
     # Asymmetric: one hairpin end + one invertron end (no symmetric TIR expected for pELF)
@@ -547,119 +401,6 @@ def detect_coverage_drop_ends(bam_file: str, contig_id: str,
             "right_drop": right_ratio < 0.50,
             "consistent_with_linear": (left_ratio < 0.50 or right_ratio < 0.50),
         }
-    except Exception as e:
-        return {"available": False, "message": str(e)}
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# MODULE 2d: IDR/TATA PALINDROME DETECTION IN RAW LONG READS  (Hashimoto 2019)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def detect_idr_in_reads(bam_file: str, contig_id: str, contig_len: int,
-                         end_window: int = 15_000, min_arm: int = 500,
-                         max_reads: int = 500) -> dict:
-    """
-    Scan long reads mapping near the contig ends for the full arm1—TATA—arm2
-    palindrome (Hashimoto 2019, Fig 3).
-
-    Why this is needed
-    ------------------
-    Short-read assembly truncates at the palindrome centre: the hairpin fold
-    prevents adapter ligation so read coverage drops to zero at the tip, and the
-    assembled contig starts at the TATA itself (tata_at_terminus).  A single long
-    read that begins at the physical left end of the plasmid carries:
-
-        [IDR arm1 (~5 kb)] [TATA] [IDR arm2 = rc(arm1) (~5 kb)] [plasmid body ...]
-
-    detect_idr_tata() finds this structure correctly when the TATA is at position
-    ~5000 in the read rather than at position 0.
-
-    Strategy
-    --------
-    Fetch reads whose alignment START is within end_window of contig position 0
-    (left end) or whose alignment END is within end_window of contig_len (right
-    end).  For each qualifying read call detect_idr_tata() on the full query
-    sequence.  Report the best (longest-arm) hit found.
-
-    Parameters
-    ----------
-    end_window  : how far from the contig end to look for reads (default 15 000 bp)
-    min_arm     : minimum IDR arm length to call a match (default 500 bp)
-    max_reads   : cap on reads examined per end to bound runtime (default 500)
-
-    Returns
-    -------
-    dict with keys:
-      available        : bool  (False when pysam missing or BAM absent)
-      found            : bool  (True if full palindrome detected in ≥1 read)
-      best_arm_bp      : int   arm length of best hit (0 if not found)
-      best_identity    : float identity of best hit
-      best_read        : str   read name of best hit
-      end              : str   "left" | "right" | None
-      reads_checked    : int
-    """
-    try:
-        import pysam
-    except ImportError:
-        return {"available": False, "message": "pysam not installed"}
-
-    if not bam_file or not os.path.exists(bam_file):
-        return {"available": False, "message": "BAM file not found"}
-
-    try:
-        bam = pysam.AlignmentFile(bam_file, "rb")
-
-        best = {
-            "available":     True,
-            "found":         False,
-            "best_arm_bp":   0,
-            "best_identity": 0.0,
-            "best_read":     None,
-            "end":           None,
-            "reads_checked": 0,
-        }
-
-        def _check_reads_near(fetch_start: int, fetch_end: int, end_label: str):
-            checked = 0
-            for read in bam.fetch(contig_id, fetch_start, fetch_end):
-                if read.is_unmapped or read.is_secondary or read.is_supplementary:
-                    continue
-                qs = read.query_sequence
-                if not qs or len(qs) < 2 * min_arm + 4:
-                    continue
-
-                # Run full palindrome detection on the raw read sequence.
-                # Pass window = full read length so the palindrome is not
-                # clipped if it lies away from the read ends.
-                r = detect_idr_tata(qs, window=len(qs), min_arm=min_arm)
-
-                if r["found"] and r["best_arm_bp"] > best["best_arm_bp"]:
-                    # Extract identity from whichever end had the best match
-                    best_det = max(
-                        (r["details"][e] for e in r["found_ends"]),
-                        key=lambda d: d["arm_length"],
-                    )
-                    best.update({
-                        "found":         True,
-                        "best_arm_bp":   r["best_arm_bp"],
-                        "best_identity": best_det["identity"],
-                        "best_read":     read.query_name,
-                        "end":           end_label,
-                    })
-
-                checked += 1
-                best["reads_checked"] += 1
-                if checked >= max_reads:
-                    break
-
-        # Left end: reads that start within end_window of contig position 0
-        _check_reads_near(0, end_window, "left")
-        # Right end: reads that end within end_window of contig_len
-        _check_reads_near(max(0, contig_len - end_window), contig_len, "right")
-
-        bam.close()
-        return best
-
     except Exception as e:
         return {"available": False, "message": str(e)}
 
@@ -1248,27 +989,7 @@ def compute_score(evidence: dict) -> dict:
     if sc.get("found"):
         score += SCORING_WEIGHTS["self_complement_end"]
         breakdown["self_complement_end"] = SCORING_WEIGHTS["self_complement_end"]
-    if sc.get("tata_motif_left") or sc.get("tata_motif_right"):
-        score += SCORING_WEIGHTS["hairpin_end"]
-        breakdown["hairpin_end"] = SCORING_WEIGHTS["hairpin_end"]
-
-    # 2b. IDR + TATA loop (Hashimoto 2019 pELF1 signature)
-    idr = evidence.get("idr_tata", {})
-    if idr.get("found"):
-        score += SCORING_WEIGHTS["idr_tata_detected"]
-        breakdown["idr_tata_detected"] = SCORING_WEIGHTS["idr_tata_detected"]
-    # Terminal TATA: assembler stopped at palindrome centre (hairpin tip assembly artefact)
-    if idr.get("tata_at_terminus"):
-        score += SCORING_WEIGHTS["tata_at_terminus"]
-        breakdown["tata_at_terminus"] = SCORING_WEIGHTS["tata_at_terminus"]
-
-    # Full palindrome in a raw long read — strongest IDR evidence possible
-    idr_reads = evidence.get("idr_reads", {})
-    if idr_reads.get("available") and idr_reads.get("found"):
-        score += SCORING_WEIGHTS["idr_in_reads"]
-        breakdown["idr_in_reads"] = SCORING_WEIGHTS["idr_in_reads"]
-
-    # 2c. Asymmetric ends (pELF1-type: one hairpin + one invertron)
+    # 2b. Asymmetric ends (pELF1-type: one hairpin + one invertron)
     asym = evidence.get("asymmetric_ends", {})
     if asym.get("asymmetric_pelf_type"):
         score += SCORING_WEIGHTS["asymmetric_ends"]
@@ -1633,370 +1354,6 @@ def map_shortreads(assembly_fasta: str, output_bam: str,
     return result
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# MODULE 10: LEFT-END VISUALIZATION  (Fig. 3 style, Hashimoto 2019)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def visualize_left_end_structure(
-    seq: str,
-    contig_id: str,
-    idr_result: dict,
-    bam_file: str = None,
-    output_prefix: str = "left_end",
-    window: int = 15_000,
-) -> str:
-    """
-    Figure-3-style visualization of the pELF1 left-end IDR/TATA hairpin
-    (Hashimoto et al. 2019, Front. Microbiol., Fig. 3).
-
-    Panel A  Coverage-depth pileup with:
-             · Two converging grey arrows: IDR arm 1 (→) and arm 2 (←)
-             · Bounding box at the IDR junction (as in Fig. 3A)
-             · Vertical dashed line at the TATA centre
-             · ~80 bp sequence snippet with TATA highlighted in red
-    Panel B  Schematic stem–loop (hairpin):
-             5′ ─── arm 1 ─── [TATA] ─── arm 2 ───  (as in Fig. 3B)
-
-    Parameters
-    ----------
-    seq            : full contig sequence
-    contig_id      : contig name (used for BAM fetch and output filename)
-    idr_result     : return value of detect_idr_tata()
-    bam_file       : sorted, indexed BAM — actual read depth if present,
-                     otherwise a schematic depth profile is drawn
-    output_prefix  : output filename prefix
-    window         : bp to examine at the left end (default 15 000)
-
-    Returns the saved PNG path, or '' on failure.
-    Requires matplotlib (conda install -c conda-forge matplotlib).
-    """
-    try:
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-        import matplotlib.patches as mpatches
-        from matplotlib.ticker import FuncFormatter
-    except ImportError:
-        print("[WARN] matplotlib not installed — skipping left-end visualization. "
-              "Install with: conda install -c conda-forge matplotlib", file=sys.stderr)
-        return ""
-
-    # ── Left-end region ──────────────────────────────────────────────────────
-    chk    = min(window, len(seq) // 2)
-    region = seq[:chk].upper()
-    n      = len(region)
-
-    # ── IDR / TATA positions from detect_idr_tata() ──────────────────────────
-    left_idr         = idr_result.get("details", {}).get("left", {})
-    tata_pos         = left_idr.get("tata_pos", -1)
-    arm_len          = left_idr.get("arm_length", 0)
-    idr_identity     = left_idr.get("identity", 0.0)
-    tata_at_terminus = idr_result.get("tata_at_terminus", False)
-
-    if tata_pos < 0:
-        tata_pos = region.find(HAIRPIN_CENTRAL_MOTIF)   # fallback
-
-    # ── Coverage depth ───────────────────────────────────────────────────────
-    depths    = None
-    schematic = True
-
-    if bam_file and os.path.exists(bam_file):
-        try:
-            import pysam
-            bam = pysam.AlignmentFile(bam_file, "rb")
-            arr = np.zeros(n, dtype=np.float32)
-            for col in bam.pileup(contig_id, 0, n,
-                                  min_mapping_quality=0, stepper="all"):
-                pos = col.reference_pos
-                if 0 <= pos < n:
-                    arr[pos] = col.nsegments
-            bam.close()
-            depths    = arr
-            schematic = False
-        except Exception as exc:
-            print(f"[WARN] BAM coverage extraction failed ({exc}); "
-                  "using schematic depth.", file=sys.stderr)
-
-    if depths is None:
-        # Schematic: full depth outside IDR region, half inside IDR arms,
-        # near-zero at the TATA hairpin tip (Hashimoto 2019 Fig. 3A pattern)
-        depths = np.full(n, 50.0, dtype=np.float32)
-        if arm_len > 0 and tata_pos > 0:
-            idr_end = min(n, tata_pos + 4 + arm_len)
-            depths[:idr_end] = 25.0          # half depth across IDR arms
-            hw = 80                           # near-zero window at TATA tip
-            depths[max(0, tata_pos - hw): min(n, tata_pos + 4 + hw)] = 3.0
-
-    # Rolling-mean smoothing for display
-    kw = max(1, n // 400)
-    sm = np.convolve(depths, np.ones(kw) / kw, mode="same") if kw > 1 else depths.copy()
-    max_d = float(sm.max()) or 1.0
-
-    # ── Figure layout ─────────────────────────────────────────────────────────
-    fig = plt.figure(figsize=(14, 9), facecolor="white")
-    gs  = fig.add_gridspec(
-        4, 1, height_ratios=[0.09, 0.46, 0.09, 0.36],
-        hspace=0.06, top=0.92, bottom=0.06,
-    )
-    ax_arr  = fig.add_subplot(gs[0])
-    ax_cov  = fig.add_subplot(gs[1], sharex=ax_arr)
-    ax_seq  = fig.add_subplot(gs[2], sharex=ax_arr)
-    ax_hair = fig.add_subplot(gs[3])
-
-    x = np.arange(n)
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # PANEL A LABEL
-    # ─────────────────────────────────────────────────────────────────────────
-    fig.text(0.005, 0.95, "A", fontsize=13, fontweight="bold", va="top")
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # ARROW TRACK  (IDR arm 1 → …TATA… ← IDR arm 2)
-    # ─────────────────────────────────────────────────────────────────────────
-    ax_arr.set_xlim(0, n)
-    ax_arr.set_ylim(0, 1)
-    ax_arr.axis("off")
-    ax_arr.set_facecolor("#EFEFEF")
-    ax_arr.patch.set_visible(True)
-
-    if arm_len > 0 and tata_pos > 0:
-        arm2_end = min(n - 1, tata_pos + 4 + arm_len)
-
-        # Arm 1: rightward → from position 0 to tata_pos
-        ax_arr.annotate(
-            "", xy=(tata_pos, 0.50), xytext=(0, 0.50),
-            arrowprops=dict(arrowstyle="-|>", color="#444444",
-                            lw=4.0, mutation_scale=22),
-            annotation_clip=False, zorder=5,
-        )
-        # Arm 2: leftward ← from arm2_end back to tata_pos+4
-        ax_arr.annotate(
-            "", xy=(tata_pos + 4, 0.50), xytext=(arm2_end, 0.50),
-            arrowprops=dict(arrowstyle="-|>", color="#444444",
-                            lw=4.0, mutation_scale=22),
-            annotation_clip=False, zorder=5,
-        )
-
-        # Arm labels
-        ax_arr.text(tata_pos / 2, 0.82, "IDR arm 1",
-                    ha="center", va="center", fontsize=8.5, color="#222222")
-        ax_arr.text((tata_pos + 4 + arm2_end) / 2, 0.82, "IDR arm 2",
-                    ha="center", va="center", fontsize=8.5, color="#222222")
-
-        # Bounding box at the IDR junction (as in Hashimoto 2019 Fig. 3A)
-        box_half = max(200, arm_len // 6)
-        bx0 = max(0, tata_pos - box_half)
-        bw  = box_half * 2 + 4
-        ax_arr.add_patch(mpatches.FancyBboxPatch(
-            (bx0, 0.05), bw, 0.90,
-            boxstyle="square,pad=0", linewidth=2,
-            edgecolor="black", facecolor="none", zorder=7,
-        ))
-
-    elif tata_at_terminus:
-        ax_arr.text(
-            n // 2, 0.50,
-            "← Contig starts at TATA — assembler truncated at hairpin tip",
-            ha="center", va="center", fontsize=8.5, color="#333333",
-        )
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # COVERAGE / PILEUP TRACK
-    # ─────────────────────────────────────────────────────────────────────────
-    norm = sm / max_d   # normalise to [0, 1]
-
-    # Forward reads — coral/red (top half)
-    ax_cov.fill_between(x, norm, color="#D4604A", alpha=0.82, label="Forward reads")
-    # Reverse reads — steel blue (mirrored below zero)
-    ax_cov.fill_between(x, -norm, color="#4A78D4", alpha=0.82, label="Reverse reads")
-    ax_cov.axhline(0, color="black", lw=0.7)
-
-    # IDR region light shading
-    if arm_len > 0 and tata_pos > 0:
-        ax_cov.axvspan(0, min(n, tata_pos + 4 + arm_len),
-                       alpha=0.07, color="gray", zorder=0)
-
-    # TATA vertical marker
-    if tata_pos >= 0:
-        ax_cov.axvline(tata_pos + 2, color="black", lw=1.5, ls="--",
-                       alpha=0.85, zorder=8)
-        ax_cov.text(tata_pos + 2, 0.90, " TATA",
-                    transform=ax_cov.get_xaxis_transform(),
-                    fontsize=8, va="bottom", color="black")
-
-    depth_label = "Read depth  [schematic]" if schematic else f"Read depth  (max {max_d:.0f}×)"
-    ax_cov.set_ylabel(depth_label, fontsize=9)
-    ax_cov.set_ylim(-1.12, 1.12)
-    ax_cov.set_yticks([-1, 0, 1])
-    ax_cov.set_yticklabels(["rev", "0", "fwd"], fontsize=7.5)
-    ax_cov.spines["top"].set_visible(False)
-    ax_cov.spines["right"].set_visible(False)
-    ax_cov.legend(loc="upper right", fontsize=8, framealpha=0.8)
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # SEQUENCE SNIPPET TRACK
-    # ─────────────────────────────────────────────────────────────────────────
-    ax_seq.axis("off")
-
-    if tata_pos >= 0:
-        flank   = 36
-        s_start = max(0, tata_pos - flank)
-        s_end   = min(n, tata_pos + 4 + flank)
-
-        before = region[s_start:tata_pos]
-        after  = region[tata_pos + 4:s_end]
-
-        prefix_str = f"{s_start + 1}-{before}"
-        tata_str   = region[tata_pos:tata_pos + 4]    # "TATA"
-        suffix_str = f"{after}-{s_end}"
-
-        full_len   = len(prefix_str) + len(tata_str) + len(suffix_str)
-        x0_tata    = len(prefix_str) / full_len
-        x0_after   = (len(prefix_str) + len(tata_str)) / full_len
-
-        # Three text objects share the same y row; monospace → equal char widths
-        ax_seq.text(x0_tata, 0.55, prefix_str,
-                    transform=ax_seq.transAxes,
-                    ha="right", va="center",
-                    fontsize=7.5, fontfamily="monospace", color="black")
-        ax_seq.text(x0_tata, 0.55, tata_str,
-                    transform=ax_seq.transAxes,
-                    ha="left", va="center",
-                    fontsize=7.5, fontfamily="monospace",
-                    color="white", fontweight="bold",
-                    bbox=dict(facecolor="crimson", edgecolor="none",
-                              boxstyle="round,pad=0.18"))
-        ax_seq.text(x0_after, 0.55, suffix_str,
-                    transform=ax_seq.transAxes,
-                    ha="left", va="center",
-                    fontsize=7.5, fontfamily="monospace", color="black")
-        ax_seq.text(x0_tata + len(tata_str) / (2 * full_len), 0.05,
-                    "*1", transform=ax_seq.transAxes,
-                    ha="center", va="bottom", fontsize=7, color="crimson")
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # PANEL B LABEL
-    # ─────────────────────────────────────────────────────────────────────────
-    fig.text(0.005, 0.38, "B", fontsize=13, fontweight="bold", va="top")
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # HAIRPIN SCHEMATIC  (Fig. 3B style)
-    # ─────────────────────────────────────────────────────────────────────────
-    ax_hair.set_xlim(-0.8, 13.0)
-    ax_hair.set_ylim(-0.7, 2.6)
-    ax_hair.axis("off")
-
-    if arm_len > 0 and tata_pos > 0:
-        arm_d  = 5.0    # display units per arm
-        y_mid  = 1.4    # vertical centre
-        lw_ds  = 2.8    # double-strand linewidth
-
-        def _draw_dsdna(ax, x0, x1, y=y_mid, color="royalblue", lw=lw_ds):
-            """Two parallel lines + evenly spaced tick marks = double-stranded DNA."""
-            for dy in (-0.10, +0.10):
-                ax.plot([x0, x1], [y + dy, y + dy],
-                        color=color, lw=lw, solid_capstyle="round")
-            for xt in np.arange(x0 + 0.45, x1, 0.60):
-                ax.plot([xt, xt], [y - 0.10, y + 0.10],
-                        color=color, lw=1.0, alpha=0.45)
-
-        # Arm 1
-        _draw_dsdna(ax_hair, 0.0, arm_d)
-
-        # Hairpin loop (semicircle) — the TATA is at the tip
-        loop_r  = 0.55
-        loop_cx = arm_d + loop_r
-        theta   = np.linspace(np.pi / 2, -np.pi / 2, 200)
-        ax_hair.plot(loop_cx + loop_r * np.cos(theta),
-                     y_mid + loop_r * np.sin(theta),
-                     color="royalblue", lw=lw_ds)
-
-        # TATA label inside loop (red box, matching Fig. 3B *1 annotation)
-        ax_hair.text(loop_cx + loop_r * 0.55, y_mid, "*1\nTATA",
-                     ha="center", va="center", fontsize=8,
-                     fontfamily="monospace", color="crimson",
-                     fontweight="bold", linespacing=1.3)
-
-        # Arm 2
-        arm2_x0 = arm_d + 2 * loop_r
-        _draw_dsdna(ax_hair, arm2_x0, arm2_x0 + arm_d)
-
-        # 5' label at the left end
-        ax_hair.text(-0.20, y_mid, "5′",
-                     ha="right", va="center",
-                     fontsize=10, fontstyle="italic", color="black")
-
-        # Arm-length brackets + annotations
-        for xa, xb, lbl in [
-            (0.0,    arm_d,
-             f"IDR arm 1  (~{arm_len // 1000} kb, {idr_identity:.0%} identity)"),
-            (arm2_x0, arm2_x0 + arm_d,
-             "IDR arm 2  (rc of arm 1)"),
-        ]:
-            y_br = y_mid - 0.60
-            ax_hair.annotate("", xy=(xb, y_br), xytext=(xa, y_br),
-                             arrowprops=dict(arrowstyle="<->",
-                                             color="#888888", lw=1.0))
-            ax_hair.text((xa + xb) / 2, y_br - 0.16, lbl,
-                         ha="center", va="top", fontsize=7.5, color="#555555")
-
-        # Caption footnote
-        ax_hair.text(
-            (arm2_x0 + arm_d) / 2, -0.50,
-            "*1  5′-TATA-3′ is the sequence of the hairpin loop "
-            "at the left end of pELF1 (Hashimoto et al. 2019, Fig. 3B)",
-            ha="center", va="top", fontsize=7.5, color="#666666",
-            fontstyle="italic",
-        )
-
-    else:
-        msg = ("TATA detected at terminus — full IDR arm not assembled."
-               if tata_at_terminus else
-               "No IDR/TATA structure detected in this window.")
-        ax_hair.text(6.0, 1.4, msg, ha="center", va="center",
-                     fontsize=10, color="#888888")
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # X-AXIS FORMATTING (coverage panel only)
-    # ─────────────────────────────────────────────────────────────────────────
-    def _fmt_bp(v, _):
-        return f"{v / 1000:.0f} kb" if v >= 1000 else f"{int(v)} bp"
-
-    ax_cov.xaxis.set_major_formatter(FuncFormatter(_fmt_bp))
-    plt.setp(ax_arr.get_xticklabels(), visible=False)
-    plt.setp(ax_seq.get_xticklabels(), visible=False)
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # TITLE AND FIGURE CAPTION
-    # ─────────────────────────────────────────────────────────────────────────
-    depth_src = "schematic depth" if schematic else "BAM read depth"
-    arm_info  = (f"{arm_len:,} bp arm, TATA at pos {tata_pos + 1}"
-                 if arm_len > 0 and tata_pos >= 0
-                 else ("TATA at terminus" if tata_at_terminus else "no IDR detected"))
-    fig.suptitle(
-        f"Left-end IDR/TATA hairpin structure — {contig_id}  "
-        f"({depth_src}; {arm_info})",
-        fontsize=10.5, y=0.975,
-    )
-    fig.text(
-        0.50, 0.005,
-        "FIGURE 3 | Visualization of the left-end sequence of pELF1.  "
-        "(A) Coverage of short reads mapped to the left-end sequence.  "
-        "Dark arrows represent completely identical inverted direct repeats (IDR).  "
-        "These IDRs confront each other at the region enclosed in a square.  "
-        "(B) The structure of the left end of pELF1 was predicted using the hairpin model.",
-        ha="center", va="bottom", fontsize=7.5, color="#666666", fontstyle="italic",
-    )
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # SAVE
-    # ─────────────────────────────────────────────────────────────────────────
-    safe_id  = re.sub(r"[^\w.\-]", "_", contig_id)
-    out_path = f"{output_prefix}_left_end_{safe_id}.png"
-    fig.savefig(out_path, dpi=150, bbox_inches="tight", facecolor="white")
-    plt.close(fig)
-    print(f"[OUTPUT] Left-end visualization → {out_path}")
-    return out_path
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2016,9 +1373,8 @@ def analyse_contig(record, args, annot_df, gfa_topology, ref_gc=None,
     evidence["header"] = assess_header_metadata(
         header_meta, chromosome_depth, seq_len=len(seq))
 
-    # Structural (Hashimoto 2019: hairpin, IDR/TATA, invertron end)
+    # Structural (hairpin, invertron end)
     evidence["self_complement"] = detect_self_complement_ends(seq)
-    evidence["idr_tata"]        = detect_idr_tata(seq)
     evidence["size"]            = classify_size(len(seq))
 
     # GC
@@ -2030,7 +1386,7 @@ def analyse_contig(record, args, annot_df, gfa_topology, ref_gc=None,
 
     # Asymmetric end analysis (pELF1-type, Hashimoto 2019)
     evidence["asymmetric_ends"] = detect_asymmetric_ends(
-        evidence["self_complement"], evidence["idr_tata"],
+        evidence["self_complement"],
         evidence.get("genes", {}))
 
     # PlasmidFinder no-hit flag (set externally; default False unless --no-plasmid-finder-hit)
@@ -2042,12 +1398,9 @@ def analyse_contig(record, args, annot_df, gfa_topology, ref_gc=None,
             args.bam, cid, args.chromosome_contigs)
         evidence["coverage_drop"] = detect_coverage_drop_ends(
             args.bam, cid, len(seq))
-        evidence["idr_reads"]     = detect_idr_in_reads(
-            args.bam, cid, len(seq))
     else:
         evidence["copy_number"]   = {"available": False}
         evidence["coverage_drop"] = {"available": False}
-        evidence["idr_reads"]     = {"available": False}
 
     # GFA topology
     evidence["gfa_topology"] = is_linear_in_gfa(cid, gfa_topology)
@@ -2295,15 +1648,6 @@ def main():
             "header_copy_number": hdr.get("copy_number", ""),
             "header_depth":      hdr.get("depth", ""),
             "hairpin_identity":  ev.get("self_complement", {}).get("identity", ""),
-            "tata_motif":        (ev.get("self_complement", {}).get("tata_motif_left") or
-                                  ev.get("self_complement", {}).get("tata_motif_right")),
-            "idr_tata_found":    ev.get("idr_tata", {}).get("found", ""),
-            "tata_at_terminus":  ev.get("idr_tata", {}).get("tata_at_terminus", ""),
-            "idr_arm_bp":        ev.get("idr_tata", {}).get("best_arm_bp", ""),
-            "idr_in_reads":      ev.get("idr_reads", {}).get("found", ""),
-            "idr_read_arm_bp":   ev.get("idr_reads", {}).get("best_arm_bp", ""),
-            "idr_read_identity": ev.get("idr_reads", {}).get("best_identity", ""),
-            "idr_read_name":     ev.get("idr_reads", {}).get("best_read", ""),
             "asymmetric_ends":   ev.get("asymmetric_ends", {}).get("asymmetric_pelf_type", ""),
             "invertron_tp_gene": ev.get("asymmetric_ends", {}).get("has_tp_gene", ""),
             "size_families":     "|".join(ev.get("size", {}).get("matching_families", [])),
@@ -2343,9 +1687,7 @@ def main():
             for _, row in subset.iterrows():
                 print(f"    {row['contig']:30s}  {row['length_bp']:>10,} bp  "
                       f"score={row['score']:>3}  GC={row['gc_pct']}%  "
-                      f"hairpin={row['tata_motif']}  "
-                      f"idr_tata={row['idr_tata_found']}  "
-                      f"tata_terminus={row['tata_at_terminus']}  "
+                      f"hairpin_id={row['hairpin_identity']}  "
                       f"asymmetric={row['asymmetric_ends']}")
 
     # JSON output
@@ -2355,23 +1697,8 @@ def main():
             json.dump(results, fh, indent=2, default=str)
         print(f"[OUTPUT] JSON detail    → {json_path}")
 
-    # Figure-3-style left-end visualization for IDR/TATA-positive contigs
     if args.visualize:
-        records_seqs = {r.id: str(r.seq) for r in records}
-        viz_count = 0
-        for res in results:
-            idr = res["evidence"].get("idr_tata", {})
-            if idr.get("found") or idr.get("tata_at_terminus"):
-                visualize_left_end_structure(
-                    seq           = records_seqs[res["contig"]],
-                    contig_id     = res["contig"],
-                    idr_result    = idr,
-                    bam_file      = args.bam,
-                    output_prefix = args.output,
-                )
-                viz_count += 1
-        if viz_count == 0:
-            print("[INFO] --visualize: no contigs with IDR/TATA evidence to plot.")
+        print("[INFO] --visualize: IDR/TATA visualization has been removed (TATA recognition disabled).")
 
     print("\n[DONE]")
 
