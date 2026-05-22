@@ -325,25 +325,38 @@ def detect_self_complement_ends(seq: str, window: int = 500, min_match: int = 40
 
 
 def detect_asymmetric_ends(sc_result: dict,
-                           gene_hits: dict) -> dict:
+                           gene_hits: dict,
+                           cov_result: dict = None) -> dict:
     """
     pELF1 has ASYMMETRIC ends: left = hairpin, right = invertron (terminal protein).
     This is a unique indicator of the pELF lineage (Hashimoto 2019).
 
-    Detects asymmetry when:
-      - one end shows self-complementary hairpin structure AND
-      - terminal protein gene is annotated
+    Two detection paths — either is sufficient:
+
+    Sequence + gene:
+      - Self-complementary hairpin at one end (detect_self_complement_ends) AND
+      - Terminal protein gene annotated
+
+    BAM coverage (most diagnostic with Illumina reads):
+      - Left end coverage drop (hairpin blocks adapter ligation) AND
+      - Right end coverage NOT dropped (invertron end remains accessible)
+      A symmetric drop at both ends does NOT count — that could be any palindromic
+      structure, not the pELF1-specific asymmetry.
     """
     has_hairpin = sc_result.get("found")
     has_tp_gene = bool(gene_hits.get("terminal_protein_genes"))
+    seq_asymmetric = has_hairpin and has_tp_gene
 
-    # Asymmetric: one hairpin end + one invertron end (no symmetric TIR expected for pELF)
-    asymmetric = has_hairpin and has_tp_gene
+    cov = cov_result or {}
+    bam_asymmetric = (cov.get("available") and
+                      cov.get("left_drop") and
+                      not cov.get("right_drop"))
 
     return {
-        "asymmetric_pelf_type": asymmetric,
+        "asymmetric_pelf_type": seq_asymmetric or bam_asymmetric,
         "has_hairpin_end":      has_hairpin,
         "has_tp_gene":          has_tp_gene,
+        "bam_asymmetric":       bam_asymmetric,
     }
 
 
@@ -1391,11 +1404,6 @@ def analyse_contig(record, args, annot_df, gfa_topology, ref_gc=None,
     # Gene content
     evidence["genes"] = screen_genes(annot_df, cid) if not annot_df.empty else {}
 
-    # Asymmetric end analysis (pELF1-type, Hashimoto 2019)
-    evidence["asymmetric_ends"] = detect_asymmetric_ends(
-        evidence["self_complement"],
-        evidence.get("genes", {}))
-
     # PlasmidFinder no-hit flag (set externally; default False unless --no-plasmid-finder-hit)
     evidence["plasmid_finder_no_hit"] = getattr(args, "plasmid_finder_no_hit", False)
 
@@ -1408,6 +1416,13 @@ def analyse_contig(record, args, annot_df, gfa_topology, ref_gc=None,
     else:
         evidence["copy_number"]   = {"available": False}
         evidence["coverage_drop"] = {"available": False}
+
+    # Asymmetric end analysis (pELF1-type, Hashimoto 2019)
+    # Runs after BAM so coverage_drop is available for the left-only drop path
+    evidence["asymmetric_ends"] = detect_asymmetric_ends(
+        evidence["self_complement"],
+        evidence.get("genes", {}),
+        evidence.get("coverage_drop"))
 
     # GFA topology
     evidence["gfa_topology"] = is_linear_in_gfa(cid, gfa_topology)
