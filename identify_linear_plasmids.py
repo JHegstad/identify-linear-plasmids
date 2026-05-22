@@ -365,20 +365,27 @@ def detect_asymmetric_ends(sc_result: dict,
 # ─────────────────────────────────────────────────────────────────────────────
 
 def detect_coverage_drop_ends(bam_file: str, contig_id: str,
-                               contig_len: int, end_window: int = 5000) -> dict:
+                               contig_len: int, end_window: int = 5000,
+                               tip_window: int = 10) -> dict:
     """
     Detect coverage drop at contig ends, consistent with linear plasmid terminal structure.
 
-    With Illumina reads: hairpin ends prevent adapter ligation and PCR amplification,
-    causing a sharp drop to near-zero at the terminal region (Hashimoto 2019, Fig 3A).
-    This is the most specific signal.
+    Two complementary checks are run:
 
-    With long reads (ONT/PacBio): reads can span hairpin loops, so a drop is not
-    guaranteed by the same mechanism. A drop may still occur due to assembly truncation
-    at the terminus or reduced mappability of the terminal palindromic sequence, but
-    is less specific than with Illumina.
+    Wide window (<end_window> bp, default 5 kb), threshold < 50% of body depth:
+      Fires when the assembled hairpin arm is present in the contig and Illumina
+      reads cannot be generated from it (adapter ligation blocked by the hairpin
+      fold, Hashimoto 2019, Fig 3A). Also fires with ONT reads when mappability
+      is reduced across the palindromic terminal region.
 
-    Detects: mean depth in terminal <end_window> bp < 50% of plasmid body depth.
+    Narrow tip window (<tip_window> bp, default 10 bp), threshold < 10% of body depth:
+      Fires when the assembly was TRUNCATED at the palindrome centre — the hairpin
+      arm was never assembled, so the contig starts at the hairpin tip (position 1
+      = TATA / palindrome centre). In that case the very first few bases are only
+      reachable by reads genuinely starting there; no reads from "before" position 1
+      exist (the hairpin prevented their generation). Circular assemblies are not
+      confounded: soft-clipped reads from near the genome end keep position-1 depth
+      close to body depth, well above the 10% threshold.
     """
     try:
         import pysam
@@ -410,16 +417,32 @@ def detect_coverage_drop_ends(bam_file: str, contig_id: str,
         left_ratio  = avg_left  / avg_body if avg_body > 0 else 1
         right_ratio = avg_right / avg_body if avg_body > 0 else 1
 
+        # Narrow tip check: very first / last <tip_window> bp
+        tip_left_depths  = region_depths(0, min(tip_window, contig_len))
+        tip_right_depths = region_depths(max(0, contig_len - tip_window), contig_len)
+        avg_tip_left  = mean(tip_left_depths)  if tip_left_depths  else 0
+        avg_tip_right = mean(tip_right_depths) if tip_right_depths else 0
+        tip_left_ratio  = avg_tip_left  / avg_body if avg_body > 0 else 1
+        tip_right_ratio = avg_tip_right / avg_body if avg_body > 0 else 1
+        tip_left_drop  = tip_left_ratio  < 0.10
+        tip_right_drop = tip_right_ratio < 0.10
+
         bam.close()
         return {
             "available":          True,
             "left_depth_ratio":   round(left_ratio,  3),
             "right_depth_ratio":  round(right_ratio, 3),
             "body_mean_depth":    round(avg_body, 1),
-            # Drop below 50% at either end = evidence of hairpin inaccessibility
-            "left_drop":  left_ratio  < 0.50,
-            "right_drop": right_ratio < 0.50,
-            "consistent_with_linear": (left_ratio < 0.50 or right_ratio < 0.50),
+            "left_drop":          left_ratio  < 0.50,
+            "right_drop":         right_ratio < 0.50,
+            "left_tip_ratio":     round(tip_left_ratio,  3),
+            "right_tip_ratio":    round(tip_right_ratio, 3),
+            "left_tip_drop":      tip_left_drop,
+            "right_tip_drop":     tip_right_drop,
+            "consistent_with_linear": (
+                left_ratio  < 0.50 or right_ratio  < 0.50 or
+                tip_left_drop       or tip_right_drop
+            ),
         }
     except Exception as e:
         return {"available": False, "message": str(e)}
