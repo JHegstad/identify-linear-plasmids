@@ -1553,18 +1553,141 @@ def map_shortreads(assembly_fasta: str, output_bam: str,
 # VISUALIZATION  (Figure-3-style terminal structure plot)
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _extract_clip_profile(bam, contig_id: str, contig_len: int,
+                           window: int = 5000) -> dict:
+    """
+    Scan terminal windows and count per-position soft- and hard-clipped reads.
+
+    For each alignment that overlaps either terminal window:
+      left panel  — reads whose 5′ alignment start is inside the left window,
+                    split by whether the read has a soft clip (CIGAR starts S)
+                    or hard clip (CIGAR starts H) at that start position.
+      right panel — reads whose 3′ alignment end is inside the right window,
+                    split by soft clip (CIGAR ends S) or hard clip (CIGAR ends H).
+
+    A pile-up of 5′-soft-clipped reads near position 0 is the classic Illumina
+    signature of a hairpin telomere: the hairpin blocks adapter ligation so all
+    reads that would cross it terminate at the tip (Hashimoto 2019, Fig 3A).
+    Hard clips appear when the aligner truncates alignment at the hairpin boundary.
+
+    Returns dict with keys:
+      left_soft  : {pos → count}   5′-soft-clipped reads by alignment start
+      left_hard  : {pos → count}   5′-hard-clipped reads by alignment start
+      right_soft : {pos → count}   3′-soft-clipped reads by alignment end
+      right_hard : {pos → count}   3′-hard-clipped reads by alignment end
+      left_window_end  : int (x upper bound for left plot)
+      right_window_start : int (x lower bound for right plot)
+    """
+    from collections import defaultdict
+    SOFT, HARD = 4, 5
+
+    left_soft:  dict = defaultdict(int)
+    left_hard:  dict = defaultdict(int)
+    right_soft: dict = defaultdict(int)
+    right_hard: dict = defaultdict(int)
+
+    left_end   = min(window, contig_len)
+    right_start = max(0, contig_len - window)
+
+    seen: set = set()
+    for region in [(0, left_end), (right_start, contig_len)]:
+        try:
+            for read in bam.fetch(contig_id, region[0], region[1]):
+                if read.is_unmapped or not read.cigartuples:
+                    continue
+                uid = (read.query_name, read.reference_start, read.flag)
+                if uid in seen:
+                    continue
+                seen.add(uid)
+
+                cigar     = read.cigartuples
+                ref_start = read.reference_start
+                ref_end   = read.reference_end or ref_start
+
+                # 5′-end clip (at the start of the alignment)
+                if ref_start < left_end:
+                    if cigar[0][0] == SOFT:
+                        left_soft[ref_start] += 1
+                    elif cigar[0][0] == HARD:
+                        left_hard[ref_start] += 1
+
+                # 3′-end clip (at the end of the alignment)
+                if ref_end > right_start:
+                    if cigar[-1][0] == SOFT:
+                        right_soft[ref_end] += 1
+                    elif cigar[-1][0] == HARD:
+                        right_hard[ref_end] += 1
+        except Exception:
+            pass
+
+    return {
+        "left_soft":           dict(left_soft),
+        "left_hard":           dict(left_hard),
+        "right_soft":          dict(right_soft),
+        "right_hard":          dict(right_hard),
+        "left_window_end":     left_end,
+        "right_window_start":  right_start,
+    }
+
+
+def _draw_clip_panel(ax, soft_dict: dict, hard_dict: dict,
+                     x_start: int, x_end: int,
+                     title: str, bin_size: int = 50) -> None:
+    """
+    Draw a stacked-bar histogram of soft-clip (teal) + hard-clip (orange)
+    read counts in [x_start, x_end), binned into <bin_size>-bp windows.
+    """
+    # Build bin edges and compute counts
+    edges = list(range(x_start, x_end, bin_size))
+    if not edges:
+        ax.set_visible(False)
+        return
+
+    soft_counts = []
+    hard_counts = []
+    centers     = []
+    for b in edges:
+        b_end = b + bin_size
+        sc = sum(soft_dict.get(p, 0) for p in range(b, b_end))
+        hc = sum(hard_dict.get(p, 0) for p in range(b, b_end))
+        soft_counts.append(sc)
+        hard_counts.append(hc)
+        centers.append(b + bin_size / 2)
+
+    w = bin_size * 0.85
+    ax.bar(centers, soft_counts, width=w,
+           color="#00ACC1", alpha=0.85, label="Soft clip", linewidth=0)
+    ax.bar(centers, hard_counts, width=w, bottom=soft_counts,
+           color="#FF7043", alpha=0.85, label="Hard clip", linewidth=0)
+
+    ax.set_xlim(x_start, x_end)
+    ax.set_title(title, fontsize=8.5, pad=3)
+    ax.set_xlabel("Position (bp)", fontsize=7.5)
+    ax.set_ylabel("Clipped reads", fontsize=7.5)
+    ax.tick_params(labelsize=7)
+    ax.legend(fontsize=7, loc="upper right", framealpha=0.7)
+
+    # Mark position 0 / contig end with a dashed line
+    boundary = x_start if x_start == 0 else x_end
+    ax.axvline(boundary, color="black", linewidth=0.8, linestyle="--", alpha=0.5)
+
+
 def visualize_terminal_structure(contig_id: str, seq: str, evidence: dict,
                                    bam_file: str, output_prefix: str) -> str:
     """
-    Generate a Figure-3-style PNG showing coverage depth and IDR/TATA
-    terminal structure for a single contig.
+    Generate a multi-panel PNG for one contig:
 
-    Top panel (if BAM available): read-depth profile across the full contig,
-    with the terminal end-windows shaded.  Coverage-drop ratios are annotated.
-
-    Bottom panel: contig backbone with IDR arm regions colour-coded (left end
-    blue, right end orange) and loop sequence labelled.  Score and identity
-    metrics are printed below.
+    Panel 1 (if BAM): full-contig coverage depth with terminal-window shading
+                      and coverage-drop ratio annotations.
+    Panel 2 (if BAM): soft-clip and hard-clip read counts at each end.
+                      Left subplot — 5′-clipped reads by alignment-start position
+                      in the first 5 kb.  Pile-up near position 0 indicates a
+                      hairpin telomere (reads cannot extend past the tip).
+                      Right subplot — 3′-clipped reads by alignment-end position
+                      in the last 5 kb; same interpretation at the right telomere.
+                      Soft clips: teal (#00ACC1).  Hard clips: orange (#FF7043).
+    Panel 3: contig schematic with IDR arm regions colour-coded (left end blue,
+             right end deep-orange) and loop sequence labelled.
 
     Returns the PNG path on success, empty string on failure.
     """
@@ -1585,37 +1708,58 @@ def visualize_terminal_structure(contig_id: str, seq: str, evidence: dict,
     sc   = evidence.get("self_complement", {})
     sc_r = evidence.get("score", {})
 
-    has_bam = cov.get("available", False) and bam_file and os.path.exists(bam_file)
+    has_bam = bool(bam_file and os.path.exists(bam_file))
 
-    # ── Collect per-position coverage ────────────────────────────────────────
+    # ── Open BAM once for all data collection ────────────────────────────────
     positions: list = []
     depths: list    = []
+    clip_data: dict = {}
+
     if has_bam:
         try:
             import pysam
             _bam = pysam.AlignmentFile(bam_file, "rb")
+            # Coverage depth
             for col in _bam.pileup(contig_id, 0, seq_len, min_mapping_quality=0):
                 positions.append(col.reference_pos)
                 depths.append(col.nsegments)
+            # Clipping profiles
+            clip_data = _extract_clip_profile(_bam, contig_id, seq_len)
             _bam.close()
-        except Exception:
+        except Exception as _e:
             has_bam = False
+            print(f"[WARN] BAM read failed for {contig_id}: {_e}", file=sys.stderr)
 
-    # ── Figure layout ─────────────────────────────────────────────────────────
-    n_rows = 2 if (has_bam and positions) else 1
-    fig = plt.figure(figsize=(14, 3 * n_rows + 0.8))
-    gs  = GridSpec(n_rows, 1, figure=fig, hspace=0.45)
+    has_coverage = has_bam and bool(positions)
+    has_clips    = has_bam and bool(clip_data)
 
-    ax_cov = fig.add_subplot(gs[0]) if n_rows == 2 else None
-    ax_str = fig.add_subplot(gs[n_rows - 1])
+    # ── Figure layout: up to 3 rows, 2 columns ───────────────────────────────
+    # Coverage and structure rows span both columns; clip row uses 2 columns.
+    panels = []
+    if has_coverage:
+        panels.append("coverage")
+    if has_clips:
+        panels.append("clips")
+    panels.append("structure")
 
-    conf   = sc_r.get("confidence", "?")
-    title  = (f"{contig_id}  |  {seq_len:,} bp  |  "
-              f"score {sc_r.get('total_score', '?')}  [{conf}]")
-    fig.suptitle(title, fontsize=10, y=1.0)
+    n_rows   = len(panels)
+    fig_h    = 3.2 * n_rows + 0.6
+    fig      = plt.figure(figsize=(14, fig_h))
+    gs       = GridSpec(n_rows, 2, figure=fig, hspace=0.55, wspace=0.25)
 
-    # ── Coverage panel ────────────────────────────────────────────────────────
-    if ax_cov and positions:
+    conf  = sc_r.get("confidence", "?")
+    title = (f"{contig_id}  |  {seq_len:,} bp  |  "
+             f"score {sc_r.get('total_score', '?')}  [{conf}]")
+    fig.suptitle(title, fontsize=10, y=1.01)
+
+    row = 0
+
+    # ── Panel 1: Coverage depth ───────────────────────────────────────────────
+    ax_cov = None
+    if "coverage" in panels:
+        ax_cov = fig.add_subplot(gs[row, :])   # span both columns
+        row += 1
+
         max_d = max(depths) if depths else 1
         ax_cov.fill_between(positions, depths, alpha=0.55, color="#4C72B0",
                             linewidth=0)
@@ -1638,56 +1782,84 @@ def visualize_terminal_structure(contig_id: str, seq: str, evidence: dict,
              seq_len - 200, "right"),
         ]:
             if ratio is not None:
-                colour = "red" if drop else "green"
+                colour = "red" if drop else "#2E7D32"
                 ax_cov.text(xpos, max_d * 0.88,
                             f"{side}: {ratio:.2f}×",
                             fontsize=8, color=colour, ha=ha)
 
-    # ── Structure panel ───────────────────────────────────────────────────────
+    # ── Panel 2: Clipping profiles ────────────────────────────────────────────
+    if "clips" in panels:
+        ax_cl = fig.add_subplot(gs[row, 0])   # left end
+        ax_cr = fig.add_subplot(gs[row, 1])   # right end
+        row += 1
+
+        lwe = clip_data.get("left_window_end",    min(5000, seq_len))
+        rws = clip_data.get("right_window_start", max(0, seq_len - 5000))
+
+        # Adapt bin size: aim for ~60 bars per panel regardless of window size
+        bin_size = max(10, (lwe) // 60)
+
+        _draw_clip_panel(
+            ax_cl,
+            clip_data.get("left_soft",  {}),
+            clip_data.get("left_hard",  {}),
+            0, lwe,
+            title=f"Left end  (0 – {lwe:,} bp)\n5′-clipped read starts",
+            bin_size=bin_size,
+        )
+        _draw_clip_panel(
+            ax_cr,
+            clip_data.get("right_soft", {}),
+            clip_data.get("right_hard", {}),
+            rws, seq_len,
+            title=f"Right end  ({rws:,} – {seq_len:,} bp)\n3′-clipped read ends",
+            bin_size=bin_size,
+        )
+
+    # ── Panel 3: IDR structure schematic ─────────────────────────────────────
+    ax_str = fig.add_subplot(gs[row, :])   # span both columns
+
     ax_str.set_xlim(-seq_len * 0.02, seq_len * 1.02)
     ax_str.set_ylim(-0.8, 1.6)
     ax_str.axis("off")
-    ax_str.set_title("Terminal IDR structure", fontsize=9)
+    ax_str.set_title("Terminal IDR / TATA structure", fontsize=9)
 
-    # Backbone
     ax_str.plot([0, seq_len], [0.5, 0.5], color="black", linewidth=4,
                 solid_capstyle="butt", zorder=1)
 
-    colours   = {"left": "#1565C0", "right": "#E64A19"}
-    arm_y     = 0.5
-    arm_h     = 0.28    # height of the axvspan highlight
+    arm_colours = {"left": "#1565C0", "right": "#E64A19"}
+    arm_y  = 0.5
+    arm_h  = 0.28
 
     for side, idr_side in [("left",  idr.get("left",  {})),
                             ("right", idr.get("right", {}))]:
         if not idr_side.get("found"):
             continue
-        arm_len  = idr_side.get("arm_len", 0)
-        loop_seq = idr_side.get("loop_seq", "")
-        identity = idr_side.get("identity", 0.0)
-        loop_len = len(loop_seq)
+        arm_len   = idr_side.get("arm_len", 0)
+        loop_seq  = idr_side.get("loop_seq", "")
+        identity  = idr_side.get("identity", 0.0)
+        loop_len  = len(loop_seq)
         confirmed = idr_side.get("confirmed", False)
-        col = colours[side]
+        col       = arm_colours[side]
 
         if side == "left":
             x_a1 = (0,        arm_len)
             x_lp = (arm_len,  arm_len + loop_len)
             x_a2 = (arm_len + loop_len, arm_len + loop_len + arm_len)
         else:
-            x_a2 = (seq_len - arm_len,             seq_len)
-            x_lp = (seq_len - arm_len - loop_len,  seq_len - arm_len)
+            x_a2 = (seq_len - arm_len,              seq_len)
+            x_lp = (seq_len - arm_len - loop_len,   seq_len - arm_len)
             x_a1 = (seq_len - 2*arm_len - loop_len, x_lp[0])
 
+        ymin_frac = (arm_y - arm_h / 2 + 0.5) / 2
+        ymax_frac = (arm_y + arm_h / 2 + 0.5) / 2
         for x0, x1, alpha in [(x_a1[0], x_a1[1], 0.55),
                                (x_a2[0], x_a2[1], 0.30)]:
-            ax_str.axvspan(x0, x1,
-                           ymin=(arm_y - arm_h/2 + 0.5) / 2,
-                           ymax=(arm_y + arm_h/2 + 0.5) / 2,
+            ax_str.axvspan(x0, x1, ymin=ymin_frac, ymax=ymax_frac,
                            alpha=alpha, color=col, zorder=2)
 
         if loop_len:
-            ax_str.axvspan(x_lp[0], x_lp[1],
-                           ymin=(arm_y - arm_h/2 + 0.5) / 2,
-                           ymax=(arm_y + arm_h/2 + 0.5) / 2,
+            ax_str.axvspan(x_lp[0], x_lp[1], ymin=ymin_frac, ymax=ymax_frac,
                            alpha=0.75, color="gold", zorder=3)
             mid_lp = (x_lp[0] + x_lp[1]) / 2
             ax_str.text(mid_lp, arm_y + 0.58, loop_seq,
@@ -1700,24 +1872,23 @@ def visualize_terminal_structure(contig_id: str, seq: str, evidence: dict,
                     f"IDR {side}  {arm_len} bp  {identity:.0%}  {marker}",
                     ha="center", va="bottom", fontsize=8, color=col)
 
-    # Legend / metrics below backbone
-    sc_id  = sc.get("identity", 0.0)
+    sc_id = sc.get("identity", 0.0)
     ax_str.text(seq_len / 2, arm_y - 0.68,
                 f"SC identity (500 bp): {sc_id:.1%}   "
                 f"IDR left: {idr.get('left', {}).get('confirmed', False)}   "
                 f"IDR right: {idr.get('right', {}).get('confirmed', False)}",
                 ha="center", va="center", fontsize=7.5, color="dimgray")
 
-    # Patches legend
     legend_patches = [
-        mpatches.Patch(color=colours["left"],  alpha=0.6, label="IDR arm (left)"),
-        mpatches.Patch(color=colours["right"], alpha=0.6, label="IDR arm (right)"),
-        mpatches.Patch(color="gold",           alpha=0.8, label="Loop / TATA"),
+        mpatches.Patch(color=arm_colours["left"],  alpha=0.6, label="IDR arm (left)"),
+        mpatches.Patch(color=arm_colours["right"], alpha=0.6, label="IDR arm (right)"),
+        mpatches.Patch(color="gold",               alpha=0.8, label="Loop / TATA"),
     ]
     ax_str.legend(handles=legend_patches, loc="lower right",
                   fontsize=7, framealpha=0.7)
 
-    safe_id = re.sub(r"[^\w.-]", "_", contig_id)
+    # ── Save ──────────────────────────────────────────────────────────────────
+    safe_id  = re.sub(r"[^\w.-]", "_", contig_id)
     out_path = f"{output_prefix}_{safe_id}_terminal.png"
     try:
         plt.savefig(out_path, dpi=150, bbox_inches="tight", facecolor="white")
