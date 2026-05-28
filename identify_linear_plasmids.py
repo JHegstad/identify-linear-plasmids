@@ -190,6 +190,31 @@ CONFIDENCE_THRESHOLDS = {
     "LOW":    15,   # 15–39 points → weak evidence
 }
 
+# Loop sequences flanked by IDR arms in hairpin telomeres.
+# Primary: TATA (pELF1, Hashimoto 2019). Variants observed or expected:
+#   TATATA / ATATAT — AT-repeat extension of the TATA motif
+#   ATAT            — same dinucleotide, reverse orientation (detected after
+#                     right-end reversal in detect_idr_tata_ends)
+#   TTAA / AATT     — AT-rich palindromic alternatives
+#   TAAT / ATTA     — TA-dinucleotide palindromes
+#   TATAAT          — Pribnow-box-like extension; seen in distantly related
+#                     linear replicons (Borrelia telomere variants)
+# An empty loop (perfect fold-back hairpin, no spacer) is also accepted.
+HAIRPIN_LOOP_MOTIFS = [
+    "TATA",
+    "TATATA",
+    "ATAT",
+    "ATATAT",
+    "ATATA",
+    "TATAT",
+    "TTAA",
+    "AATT",
+    "TAAT",
+    "ATTA",
+    "TATAAT",
+    "TATAAA",
+]
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MODULE 0: FASTA HEADER METADATA PARSER
@@ -361,10 +386,102 @@ def detect_asymmetric_ends(sc_result: dict,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# MODULE 2b: IDR / TATA HAIRPIN TELOMERE DETECTION
+# ─────────────────────────────────────────────────────────────────────────────
+
+def detect_idr_tata_ends(seq: str, search_window: int = 150,
+                          min_arm: int = 6, max_arm: int = 40,
+                          max_loop: int = 16, min_identity: float = 0.80) -> dict:
+    """
+    Search for an IDR-loop-IDR hairpin telomere structure at each sequence end.
+
+    Structure searched in the terminal window: 5'--[arm]--[loop]--[RC(arm)]--3'
+
+    For the left end, the window is seq[:search_window].
+    For the right end, the window is seq[-search_window:] reversed (simple
+    reversal, not RC) so the 3' tip is at index 0; this preserves the palindrome
+    property — if the right end is RC(arm)--loop--arm, reversing gives
+    arm_rev--loop_rev--RC(arm)_rev and the RC test arm_rev ≈ RC(RC(arm)_rev)
+    simplifies to arm_rev ≈ complement(arm), which passes for AT-symmetric arms.
+    TATA reversed is ATAT, which is included in HAIRPIN_LOOP_MOTIFS.
+
+    A loop that is:
+      - present in HAIRPIN_LOOP_MOTIFS, OR
+      - ≥ 75% AT-rich, OR
+      - empty (perfect fold-back hairpin)
+    is considered a confirmed IDR/TATA motif.  An IDR without such a loop is
+    still reported but does NOT count as "confirmed".
+
+    Returns:
+      left  : scan results for left end
+      right : scan results for right end
+      either_end     : True if IDR found at either end
+      confirmed_idr_tata : True if IDR + valid loop found at either end
+    """
+    if len(seq) < 2 * min_arm:
+        return {"left": {"found": False}, "right": {"found": False},
+                "either_end": False, "confirmed_idr_tata": False}
+
+    def _scan_tip(tip: str) -> dict:
+        best = {"found": False, "arm_len": 0, "loop_seq": "", "identity": 0.0,
+                "loop_motif_match": False, "at_rich_loop": False,
+                "confirmed": False}
+        tip_len = len(tip)
+        for arm_len in range(min_arm, min(max_arm + 1,
+                                          (tip_len - 0) // 2 + 1)):
+            for loop_len in range(0, max_loop + 1):
+                total = arm_len * 2 + loop_len
+                if total > tip_len:
+                    break
+                arm1 = tip[:arm_len]
+                loop = tip[arm_len:arm_len + loop_len]
+                arm2 = tip[arm_len + loop_len:arm_len + loop_len + arm_len]
+                rc_arm2 = str(Seq(arm2).reverse_complement())
+                identity = sum(a == b for a, b in zip(arm1, rc_arm2)) / arm_len
+                if identity < min_identity:
+                    continue
+                loop_upper = loop.upper()
+                loop_motif = (not loop) or any(
+                    m in loop_upper or loop_upper in m
+                    for m in HAIRPIN_LOOP_MOTIFS
+                )
+                at_rich = (not loop) or (
+                    sum(c in "AT" for c in loop_upper) / len(loop) >= 0.75
+                )
+                confirmed = loop_motif or at_rich
+                # Keep best by: confirmed first, then identity
+                if identity > best["identity"] or (
+                        confirmed and not best["confirmed"] and identity >= min_identity):
+                    best = {
+                        "found":            True,
+                        "arm_len":          arm_len,
+                        "loop_seq":         loop,
+                        "identity":         round(identity, 3),
+                        "loop_motif_match": loop_motif,
+                        "at_rich_loop":     at_rich,
+                        "confirmed":        confirmed,
+                    }
+        return best
+
+    left_tip  = seq[:search_window].upper()
+    right_tip = seq[-search_window:].upper()[::-1]   # simple reversal; see docstring
+
+    left_result  = _scan_tip(left_tip)
+    right_result = _scan_tip(right_tip)
+
+    return {
+        "left":               left_result,
+        "right":              right_result,
+        "either_end":         left_result["found"] or right_result["found"],
+        "confirmed_idr_tata": left_result.get("confirmed") or right_result.get("confirmed"),
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # MODULE 2c: COVERAGE DROP AT ENDS  (Hashimoto 2019)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def detect_coverage_drop_ends(bam_file: str, contig_id: str,
+def detect_coverage_drop_ends(bam_file, contig_id: str,
                                contig_len: int, end_window: int = 5000,
                                tip_window: int = 10) -> dict:
     """
@@ -392,11 +509,18 @@ def detect_coverage_drop_ends(bam_file: str, contig_id: str,
     except ImportError:
         return {"available": False, "message": "pysam not installed"}
 
-    if not bam_file or not os.path.exists(bam_file):
-        return {"available": False, "message": "BAM not found"}
+    close_when_done = False
+    if isinstance(bam_file, str):
+        if not bam_file or not os.path.exists(bam_file):
+            return {"available": False, "message": "BAM not found"}
+        try:
+            bam_file = pysam.AlignmentFile(bam_file, "rb")
+            close_when_done = True
+        except Exception as e:
+            return {"available": False, "message": str(e)}
 
     try:
-        bam = pysam.AlignmentFile(bam_file, "rb")
+        bam = bam_file
 
         def region_depths(start, end):
             return [col.nsegments
@@ -427,8 +551,7 @@ def detect_coverage_drop_ends(bam_file: str, contig_id: str,
         tip_left_drop  = tip_left_ratio  < 0.10
         tip_right_drop = tip_right_ratio < 0.10
 
-        bam.close()
-        return {
+        result = {
             "available":          True,
             "left_depth_ratio":   round(left_ratio,  3),
             "right_depth_ratio":  round(right_ratio, 3),
@@ -444,7 +567,15 @@ def detect_coverage_drop_ends(bam_file: str, contig_id: str,
                 tip_left_drop       or tip_right_drop
             ),
         }
+        if close_when_done:
+            bam.close()
+        return result
     except Exception as e:
+        if close_when_done:
+            try:
+                bam_file.close()
+            except Exception:
+                pass
         return {"available": False, "message": str(e)}
 
 
@@ -644,45 +775,44 @@ def screen_genes(annot_df: pd.DataFrame, contig_id: str) -> dict:
     all_products = subset["product"].fillna("").astype(str).str.lower().tolist()
     all_text     = all_genes + all_products
 
-    # Linear plasmid gene keywords
+    def _word_match(keyword, texts):
+        """True if keyword appears as a whole word (case-insensitive)."""
+        pat = r'(?<![a-z0-9])' + re.escape(keyword.lower()) + r'(?![a-z0-9])'
+        return any(re.search(pat, t) for t in texts)
+
+    # Linear plasmid gene keywords — word-boundary to prevent substring FP
+    # (e.g. "rep" matching "separate", "para" matching "paracoccus")
     for kw in LINEAR_PLASMID_GENE_KEYWORDS:
-        matches = [t for t in all_text if kw.lower() in t]
-        if matches:
+        if _word_match(kw, all_text):
             hits["linear_plasmid_keywords"].append(kw)
 
     # Toxin-antitoxin systems
     for system, genes in TAS_GENES.items():
-        found = [g for g in genes if any(g.lower() in t for t in all_text)]
+        found = [g for g in genes if _word_match(g, all_text)]
         if len(found) >= 1:
             hits["tas_systems"].append(system)
 
     # Partition systems
     for par, pfams in PAR_PFAM.items():
-        if any(par.lower() in t for t in all_text):
+        if _word_match(par, all_text):
             hits["partition_genes"].append(par)
 
     # Resistance genes
     for gene, description in RESISTANCE_GENES.items():
-        if any(gene.lower() in t for t in all_text):
+        if _word_match(gene, all_text):
             hits["resistance_genes"].append(f"{gene} ({description})")
 
-    # IS elements
+    # IS elements — substring OK: IS1216 intentionally matches IS1216E/V variants
     for is_elem in LINEAR_PLASMID_IS:
         if any(is_elem.lower() in t for t in all_text):
             hits["is_elements"].append(is_elem)
 
-    # Organism-specific markers
-    def _word_match(keyword, texts):
-        """True if keyword appears as a whole word in any text (case-insensitive)."""
-        pat = r'(?<![a-z0-9])' + re.escape(keyword.lower()) + r'(?![a-z0-9])'
-        return any(re.search(pat, t) for t in texts)
-
     # Enterococcal pELF markers (Hashimoto 2019 / Boumamoud 2022)
     enterococcal_m = ["is1216", "ftsK", "soj", "ftsk", "vana", "vanb"]
     hits["enterococcal_markers"] = [m for m in enterococcal_m
-                                    if any(m.lower() in t for t in all_text)]
+                                    if _word_match(m, all_text)]
 
-    # Terminal protein genes — word-boundary to avoid FP from e.g. "C-terminal"
+    # Terminal protein genes — word-boundary to avoid FP from "C-terminal"
     hits["terminal_protein_genes"] = [
         kw for kw in INVERTRON_TP_GENE_KEYWORDS
         if _word_match(kw, all_text)
@@ -691,18 +821,15 @@ def screen_genes(annot_df: pd.DataFrame, contig_id: str) -> dict:
     # repB / Rep_2 superfamily (Hashimoto 2019: pELF1 replication initiation)
     rep2_keywords = ["repb", "rep_2", "rep2", "replication initiation"]
     hits["repB_rep2"] = [kw for kw in rep2_keywords
-                         if any(kw in t for t in all_text)]
+                         if _word_match(kw, all_text)]
 
     # ftsK + parA + repB co-occurrence signature (Hashimoto 2019 confirmed trio)
-    trio = {"ftsk": False, "para": False, "repb": False}
-    for t in all_text:
-        if "ftsk" in t or "ftsK" in t: trio["ftsk"] = True
-        if "para" in t or "parA" in t: trio["para"] = True
-        if "repb" in t or "repB" in t: trio["repb"] = True
+    trio = {"ftsk": _word_match("ftsk", all_text),
+            "para": _word_match("parA", all_text),
+            "repb": _word_match("repB", all_text)}
     hits["ftsK_parA_repB_trio"] = [k for k, v in trio.items() if v]
 
     # IS1216E flanking in same direction (vanM cluster structure, Hashimoto 2019)
-    # Heuristic: both IS1216 variants present = flanking likely
     is_variants = [e for e in ["IS1216E", "IS1216V", "IS1216"]
                    if any(e.lower() in t for t in all_text)]
     hits["is1216_variants"] = is_variants
@@ -714,12 +841,13 @@ def screen_genes(annot_df: pd.DataFrame, contig_id: str) -> dict:
 # MODULE 6: COPY NUMBER ESTIMATION (from BAM coverage)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def estimate_copy_number(bam_file: str, contig_id: str,
+def estimate_copy_number(bam_file, contig_id: str,
                          chromosome_contigs: list = None) -> dict:
     """
     Estimate copy number of a contig relative to the chromosome by comparing
     mean read depths (~1 copy/cell characteristic of linear plasmids).
 
+    bam_file: path string OR open pysam.AlignmentFile (shared handle).
     Requires pysam. Falls back gracefully if not installed.
     """
     try:
@@ -727,11 +855,18 @@ def estimate_copy_number(bam_file: str, contig_id: str,
     except ImportError:
         return {"available": False, "message": "pysam not installed"}
 
-    if not bam_file or not os.path.exists(bam_file):
-        return {"available": False, "message": "BAM file not found"}
+    close_when_done = False
+    if isinstance(bam_file, str):
+        if not bam_file or not os.path.exists(bam_file):
+            return {"available": False, "message": "BAM file not found"}
+        try:
+            bam_file = pysam.AlignmentFile(bam_file, "rb")
+            close_when_done = True
+        except Exception as e:
+            return {"available": False, "message": str(e)}
 
     try:
-        bam = pysam.AlignmentFile(bam_file, "rb")
+        bam = bam_file
 
         def mean_depth(ctg):
             depths = [col.nsegments for col in bam.pileup(ctg, min_mapping_quality=20)]
@@ -748,7 +883,8 @@ def estimate_copy_number(bam_file: str, contig_id: str,
         if chrom_depth and chrom_depth > 0:
             copy_number = round(plasmid_depth / chrom_depth, 2)
 
-        bam.close()
+        if close_when_done:
+            bam.close()
         return {
             "available": True,
             "plasmid_depth": round(plasmid_depth, 1),
@@ -757,6 +893,11 @@ def estimate_copy_number(bam_file: str, contig_id: str,
             "consistent_with_linear": (copy_number is not None and 0.5 <= copy_number <= 3.0),
         }
     except Exception as e:
+        if close_when_done:
+            try:
+                bam_file.close()
+            except Exception:
+                pass
         return {"available": False, "message": str(e)}
 
 
@@ -1027,11 +1168,20 @@ def compute_score(evidence: dict) -> dict:
         score += SCORING_WEIGHTS["header_copy_number"]
         breakdown["header_copy_number"] = SCORING_WEIGHTS["header_copy_number"]
 
-    # 1. Hairpin / self-complement
+    # 1. Hairpin / self-complement (broad: left ≈ RC(right) over 500 bp)
     sc = evidence.get("self_complement", {})
     if sc.get("found"):
         score += SCORING_WEIGHTS["self_complement_end"]
         breakdown["self_complement_end"] = SCORING_WEIGHTS["self_complement_end"]
+
+    # 1b. Confirmed IDR/TATA hairpin telomere (specific: arm + known loop motif)
+    # Requires detect_idr_tata_ends to confirm arm+loop structure — mere TATA
+    # bases at the tip are insufficient without the flanking IDR arms.
+    idr = evidence.get("idr_tata", {})
+    if idr.get("confirmed_idr_tata"):
+        score += SCORING_WEIGHTS["hairpin_end"]
+        breakdown["hairpin_end"] = SCORING_WEIGHTS["hairpin_end"]
+
     # 2b. Asymmetric ends (pELF1-type: one hairpin + one invertron)
     asym = evidence.get("asymmetric_ends", {})
     if asym.get("asymmetric_pelf_type"):
@@ -1400,12 +1550,199 @@ def map_shortreads(assembly_fasta: str, output_bam: str,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# VISUALIZATION  (Figure-3-style terminal structure plot)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def visualize_terminal_structure(contig_id: str, seq: str, evidence: dict,
+                                   bam_file: str, output_prefix: str) -> str:
+    """
+    Generate a Figure-3-style PNG showing coverage depth and IDR/TATA
+    terminal structure for a single contig.
+
+    Top panel (if BAM available): read-depth profile across the full contig,
+    with the terminal end-windows shaded.  Coverage-drop ratios are annotated.
+
+    Bottom panel: contig backbone with IDR arm regions colour-coded (left end
+    blue, right end orange) and loop sequence labelled.  Score and identity
+    metrics are printed below.
+
+    Returns the PNG path on success, empty string on failure.
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from matplotlib.gridspec import GridSpec
+        import matplotlib.patches as mpatches
+    except ImportError:
+        print("[WARN] matplotlib not installed; skipping visualization. "
+              "Install with: pip install matplotlib", file=sys.stderr)
+        return ""
+
+    seq_len = len(seq)
+    idr  = evidence.get("idr_tata", {})
+    cov  = evidence.get("coverage_drop", {})
+    sc   = evidence.get("self_complement", {})
+    sc_r = evidence.get("score", {})
+
+    has_bam = cov.get("available", False) and bam_file and os.path.exists(bam_file)
+
+    # ── Collect per-position coverage ────────────────────────────────────────
+    positions: list = []
+    depths: list    = []
+    if has_bam:
+        try:
+            import pysam
+            _bam = pysam.AlignmentFile(bam_file, "rb")
+            for col in _bam.pileup(contig_id, 0, seq_len, min_mapping_quality=0):
+                positions.append(col.reference_pos)
+                depths.append(col.nsegments)
+            _bam.close()
+        except Exception:
+            has_bam = False
+
+    # ── Figure layout ─────────────────────────────────────────────────────────
+    n_rows = 2 if (has_bam and positions) else 1
+    fig = plt.figure(figsize=(14, 3 * n_rows + 0.8))
+    gs  = GridSpec(n_rows, 1, figure=fig, hspace=0.45)
+
+    ax_cov = fig.add_subplot(gs[0]) if n_rows == 2 else None
+    ax_str = fig.add_subplot(gs[n_rows - 1])
+
+    conf   = sc_r.get("confidence", "?")
+    title  = (f"{contig_id}  |  {seq_len:,} bp  |  "
+              f"score {sc_r.get('total_score', '?')}  [{conf}]")
+    fig.suptitle(title, fontsize=10, y=1.0)
+
+    # ── Coverage panel ────────────────────────────────────────────────────────
+    if ax_cov and positions:
+        max_d = max(depths) if depths else 1
+        ax_cov.fill_between(positions, depths, alpha=0.55, color="#4C72B0",
+                            linewidth=0)
+        ax_cov.set_xlabel("Position (bp)", fontsize=8)
+        ax_cov.set_ylabel("Read depth", fontsize=8)
+        ax_cov.set_xlim(0, seq_len)
+        ax_cov.tick_params(labelsize=7)
+        body_depth = cov.get("body_mean_depth", "?")
+        ax_cov.set_title(f"Coverage depth  (body mean: {body_depth}×)", fontsize=9)
+
+        end_w = 5000
+        for x0, x1 in [(0, min(end_w, seq_len)),
+                        (max(0, seq_len - end_w), seq_len)]:
+            ax_cov.axvspan(x0, x1, alpha=0.12, color="red", linewidth=0)
+
+        for side, ratio, drop, xpos, ha in [
+            ("L", cov.get("left_depth_ratio"),  cov.get("left_drop"),
+             200, "left"),
+            ("R", cov.get("right_depth_ratio"), cov.get("right_drop"),
+             seq_len - 200, "right"),
+        ]:
+            if ratio is not None:
+                colour = "red" if drop else "green"
+                ax_cov.text(xpos, max_d * 0.88,
+                            f"{side}: {ratio:.2f}×",
+                            fontsize=8, color=colour, ha=ha)
+
+    # ── Structure panel ───────────────────────────────────────────────────────
+    ax_str.set_xlim(-seq_len * 0.02, seq_len * 1.02)
+    ax_str.set_ylim(-0.8, 1.6)
+    ax_str.axis("off")
+    ax_str.set_title("Terminal IDR structure", fontsize=9)
+
+    # Backbone
+    ax_str.plot([0, seq_len], [0.5, 0.5], color="black", linewidth=4,
+                solid_capstyle="butt", zorder=1)
+
+    colours   = {"left": "#1565C0", "right": "#E64A19"}
+    arm_y     = 0.5
+    arm_h     = 0.28    # height of the axvspan highlight
+
+    for side, idr_side in [("left",  idr.get("left",  {})),
+                            ("right", idr.get("right", {}))]:
+        if not idr_side.get("found"):
+            continue
+        arm_len  = idr_side.get("arm_len", 0)
+        loop_seq = idr_side.get("loop_seq", "")
+        identity = idr_side.get("identity", 0.0)
+        loop_len = len(loop_seq)
+        confirmed = idr_side.get("confirmed", False)
+        col = colours[side]
+
+        if side == "left":
+            x_a1 = (0,        arm_len)
+            x_lp = (arm_len,  arm_len + loop_len)
+            x_a2 = (arm_len + loop_len, arm_len + loop_len + arm_len)
+        else:
+            x_a2 = (seq_len - arm_len,             seq_len)
+            x_lp = (seq_len - arm_len - loop_len,  seq_len - arm_len)
+            x_a1 = (seq_len - 2*arm_len - loop_len, x_lp[0])
+
+        for x0, x1, alpha in [(x_a1[0], x_a1[1], 0.55),
+                               (x_a2[0], x_a2[1], 0.30)]:
+            ax_str.axvspan(x0, x1,
+                           ymin=(arm_y - arm_h/2 + 0.5) / 2,
+                           ymax=(arm_y + arm_h/2 + 0.5) / 2,
+                           alpha=alpha, color=col, zorder=2)
+
+        if loop_len:
+            ax_str.axvspan(x_lp[0], x_lp[1],
+                           ymin=(arm_y - arm_h/2 + 0.5) / 2,
+                           ymax=(arm_y + arm_h/2 + 0.5) / 2,
+                           alpha=0.75, color="gold", zorder=3)
+            mid_lp = (x_lp[0] + x_lp[1]) / 2
+            ax_str.text(mid_lp, arm_y + 0.58, loop_seq,
+                        ha="center", va="bottom", fontsize=8,
+                        fontweight="bold", color="darkgoldenrod")
+
+        mid_arm = (x_a1[0] + x_a2[1]) / 2
+        marker  = "✓" if confirmed else "~"
+        ax_str.text(mid_arm, arm_y + 0.95,
+                    f"IDR {side}  {arm_len} bp  {identity:.0%}  {marker}",
+                    ha="center", va="bottom", fontsize=8, color=col)
+
+    # Legend / metrics below backbone
+    sc_id  = sc.get("identity", 0.0)
+    ax_str.text(seq_len / 2, arm_y - 0.68,
+                f"SC identity (500 bp): {sc_id:.1%}   "
+                f"IDR left: {idr.get('left', {}).get('confirmed', False)}   "
+                f"IDR right: {idr.get('right', {}).get('confirmed', False)}",
+                ha="center", va="center", fontsize=7.5, color="dimgray")
+
+    # Patches legend
+    legend_patches = [
+        mpatches.Patch(color=colours["left"],  alpha=0.6, label="IDR arm (left)"),
+        mpatches.Patch(color=colours["right"], alpha=0.6, label="IDR arm (right)"),
+        mpatches.Patch(color="gold",           alpha=0.8, label="Loop / TATA"),
+    ]
+    ax_str.legend(handles=legend_patches, loc="lower right",
+                  fontsize=7, framealpha=0.7)
+
+    safe_id = re.sub(r"[^\w.-]", "_", contig_id)
+    out_path = f"{output_prefix}_{safe_id}_terminal.png"
+    try:
+        plt.savefig(out_path, dpi=150, bbox_inches="tight", facecolor="white")
+    except Exception as e:
+        print(f"[WARN] Could not save visualization: {e}", file=sys.stderr)
+        plt.close(fig)
+        return ""
+    plt.close(fig)
+    print(f"[VIZ] {contig_id}  →  {out_path}")
+    return out_path
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # MAIN PIPELINE
 # ─────────────────────────────────────────────────────────────────────────────
 
 def analyse_contig(record, args, annot_df, gfa_topology, ref_gc=None,
-                   chromosome_depth: float = None) -> dict:
-    """Run all modules on a single contig/sequence record."""
+                   chromosome_depth: float = None,
+                   bam_handle=None) -> dict:
+    """Run all modules on a single contig/sequence record.
+
+    bam_handle: optional open pysam.AlignmentFile shared across contigs.
+    When provided it is used for coverage/copy-number analysis without
+    re-opening the BAM per contig; the caller is responsible for closing it.
+    """
     seq = str(record.seq)
     cid = record.id
 
@@ -1418,6 +1755,7 @@ def analyse_contig(record, args, annot_df, gfa_topology, ref_gc=None,
 
     # Structural (hairpin, invertron end)
     evidence["self_complement"] = detect_self_complement_ends(seq)
+    evidence["idr_tata"]        = detect_idr_tata_ends(seq)
     evidence["size"]            = classify_size(len(seq))
 
     # GC
@@ -1430,12 +1768,13 @@ def analyse_contig(record, args, annot_df, gfa_topology, ref_gc=None,
     # PlasmidFinder no-hit flag (set externally; default False unless --no-plasmid-finder-hit)
     evidence["plasmid_finder_no_hit"] = getattr(args, "plasmid_finder_no_hit", False)
 
-    # BAM-based
-    if args.bam:
+    # BAM-based — use shared handle if provided, else open from path
+    bam_src = bam_handle if bam_handle is not None else args.bam
+    if bam_src:
         evidence["copy_number"]   = estimate_copy_number(
-            args.bam, cid, args.chromosome_contigs)
+            bam_src, cid, args.chromosome_contigs)
         evidence["coverage_drop"] = detect_coverage_drop_ends(
-            args.bam, cid, len(seq))
+            bam_src, cid, len(seq))
     else:
         evidence["copy_number"]   = {"available": False}
         evidence["coverage_drop"] = {"available": False}
@@ -1450,27 +1789,45 @@ def analyse_contig(record, args, annot_df, gfa_topology, ref_gc=None,
     # GFA topology
     evidence["gfa_topology"] = is_linear_in_gfa(cid, gfa_topology)
 
-    # BLAST
+    import tempfile as _tf
+
+    # BLAST — write query to a temp file, clean up after use
     if args.blast_db:
-        tmp_fa  = f"/tmp/{cid}_query.fa"
-        tmp_out = f"/tmp/{cid}_blast.tsv"
-        with open(tmp_fa, "w") as fh:
-            fh.write(f">{cid}\n{seq}\n")
-        blast_df = run_blast(tmp_fa, args.blast_db, tmp_out,
-                             mode="blastn", identity=args.blast_identity)
-        evidence["blast"] = interpret_blast_hits(blast_df)
+        with _tf.NamedTemporaryFile(mode="w", suffix=".fa", delete=False) as tmp_fa:
+            tmp_fa.write(f">{cid}\n{seq}\n")
+            tmp_fa_path = tmp_fa.name
+        with _tf.NamedTemporaryFile(suffix=".tsv", delete=False) as tmp_out:
+            tmp_out_path = tmp_out.name
+        try:
+            blast_df = run_blast(tmp_fa_path, args.blast_db, tmp_out_path,
+                                 mode="blastn", identity=args.blast_identity)
+            evidence["blast"] = interpret_blast_hits(blast_df)
+        finally:
+            for p in (tmp_fa_path, tmp_out_path):
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
     else:
         evidence["blast"] = {"hits": 0, "linear_plasmid_hit": False}
 
-    # SKANI
+    # SKANI — same temp-file pattern; reuse query FA if already written
     if args.skani_db:
-        tmp_fa   = f"/tmp/{cid}_query.fa"
-        tmp_out  = f"/tmp/{cid}_skani.tsv"
-        with open(tmp_fa, "w") as fh:
-            fh.write(f">{cid}\n{seq}\n")
-        skani_df = run_skani(tmp_fa, args.skani_db, tmp_out,
-                             min_ani=args.skani_ani, min_af=args.skani_af)
-        evidence["skani"] = interpret_blast_hits(skani_df)
+        with _tf.NamedTemporaryFile(mode="w", suffix=".fa", delete=False) as tmp_fa:
+            tmp_fa.write(f">{cid}\n{seq}\n")
+            tmp_fa_path = tmp_fa.name
+        with _tf.NamedTemporaryFile(suffix=".tsv", delete=False) as tmp_out:
+            tmp_out_path = tmp_out.name
+        try:
+            skani_df = run_skani(tmp_fa_path, args.skani_db, tmp_out_path,
+                                 min_ani=args.skani_ani, min_af=args.skani_af)
+            evidence["skani"] = interpret_blast_hits(skani_df)
+        finally:
+            for p in (tmp_fa_path, tmp_out_path):
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
     else:
         evidence["skani"] = {"hits": 0, "linear_plasmid_hit": False}
 
@@ -1621,18 +1978,26 @@ def main():
     if gfa_topology:
         print(f"[INFO] Loaded GFA topology: {len(gfa_topology)} segments")
 
-    # Compute reference GC if not provided (median of all contigs)
+    # Parse header metadata for all records (needed for GC reference and
+    # chromosome identification before per-contig analysis)
+    all_headers = {r.id: parse_fasta_header(r.description) for r in records}
+
+    # Compute reference GC — prefer chromosomal contig(s); fall back to median
     if args.ref_gc is None:
-        all_gc = [gc_content(str(r.seq)) for r in records]
-        ref_gc = float(np.median(all_gc)) if all_gc else None
-        print(f"[INFO] Reference GC (median) = {ref_gc:.2f}%")
+        chrom_gc = [gc_content(str(r.seq)) for r in records
+                    if (all_headers[r.id]["circular"] is True and len(r.seq) > 500_000)
+                    or "chromosome" in r.id.lower()]
+        if chrom_gc:
+            ref_gc = float(np.mean(chrom_gc))
+            print(f"[INFO] Reference GC (chromosome mean) = {ref_gc:.2f}%")
+        else:
+            all_gc = [gc_content(str(r.seq)) for r in records]
+            ref_gc = float(np.median(all_gc)) if all_gc else None
+            print(f"[INFO] Reference GC (median all contigs) = {ref_gc:.2f}%")
     else:
         ref_gc = args.ref_gc
 
-    # Parse header metadata for all records; identify chromosome depth for
-    # copy-number normalisation (longest contig marked circular=true, or
-    # contig whose ID contains "chromosome")
-    all_headers = {r.id: parse_fasta_header(r.description) for r in records}
+    # Identify chromosome contig(s) for copy-number normalisation
     chromosome_depth = None
     for r in sorted(records, key=lambda x: len(x.seq), reverse=True):
         hm = all_headers[r.id]
@@ -1643,6 +2008,17 @@ def main():
             print(f"[INFO] Chromosome depth from header: {chromosome_depth:.1f}x "
                   f"({r.id})")
             break
+
+    # Auto-detect chromosome contigs for copy-number normalisation if not given
+    if not args.chromosome_contigs:
+        for r in records:
+            hm = all_headers[r.id]
+            if ((hm["circular"] is True and len(r.seq) > 500_000)
+                    or "chromosome" in r.id.lower()):
+                args.chromosome_contigs.append(r.id)
+        if args.chromosome_contigs:
+            print(f"[INFO] Auto-detected chromosome: "
+                  f"{', '.join(args.chromosome_contigs)}")
 
     # Print header metadata summary
     print(f"\n[INFO] FASTA header metadata:")
@@ -1655,12 +2031,23 @@ def main():
         print(f"  {r.id:20s}  {len(r.seq):>10,} bp  {circ}{cn}{depth}")
     print()
 
+    # Open BAM once for the whole assembly (avoids per-contig open/close overhead)
+    _bam_handle = None
+    if args.bam:
+        try:
+            import pysam as _pysam
+            _bam_handle = _pysam.AlignmentFile(args.bam, "rb")
+        except Exception as _e:
+            print(f"[WARN] Cannot pre-open BAM ({_e}); will open per-contig.",
+                  file=sys.stderr)
+
     # Analyse each contig
     results = []
     for rec in records:
         print(f"  → Analysing {rec.id} ({len(rec.seq):,} bp) ...", end=" ", flush=True)
         res = analyse_contig(rec, args, annot_df, gfa_topology, ref_gc,
-                             chromosome_depth=chromosome_depth)
+                             chromosome_depth=chromosome_depth,
+                             bam_handle=_bam_handle)
         score = res["evidence"]["score"]["total_score"]
         conf  = res["evidence"]["score"]["confidence"]
         circ  = all_headers[rec.id]["circular"]
@@ -1668,6 +2055,9 @@ def main():
                    " [circular=false]" if circ is False else "")
         print(f"score={score}  [{conf}]{circ_tag}")
         results.append(res)
+
+    if _bam_handle is not None:
+        _bam_handle.close()
 
     # Filter and sort
     results = sorted(results, key=lambda x: x["evidence"]["score"]["total_score"], reverse=True)
@@ -1693,6 +2083,11 @@ def main():
             "header_copy_number": hdr.get("copy_number", ""),
             "header_depth":      hdr.get("depth", ""),
             "hairpin_identity":  ev.get("self_complement", {}).get("identity", ""),
+            "idr_confirmed":     ev.get("idr_tata", {}).get("confirmed_idr_tata", ""),
+            "idr_left_arm_bp":   ev.get("idr_tata", {}).get("left", {}).get("arm_len", ""),
+            "idr_left_loop":     ev.get("idr_tata", {}).get("left", {}).get("loop_seq", ""),
+            "idr_right_arm_bp":  ev.get("idr_tata", {}).get("right", {}).get("arm_len", ""),
+            "idr_right_loop":    ev.get("idr_tata", {}).get("right", {}).get("loop_seq", ""),
             "asymmetric_ends":   ev.get("asymmetric_ends", {}).get("asymmetric_pelf_type", ""),
             "invertron_tp_gene": ev.get("asymmetric_ends", {}).get("has_tp_gene", ""),
             "size_families":     "|".join(ev.get("size", {}).get("matching_families", [])),
@@ -1743,7 +2138,25 @@ def main():
         print(f"[OUTPUT] JSON detail    → {json_path}")
 
     if args.visualize:
-        print("[INFO] --visualize: IDR/TATA visualization has been removed (TATA recognition disabled).")
+        viz_contigs = [r for r in results
+                       if r["evidence"]["score"]["confidence"] in ("HIGH", "MEDIUM")
+                       or r["evidence"].get("idr_tata", {}).get("either_end")]
+        if viz_contigs:
+            print(f"\n[VIZ] Generating terminal-structure plots for "
+                  f"{len(viz_contigs)} contig(s)…")
+            seq_map = {rec.id: str(rec.seq)
+                       for rec in SeqIO.parse(args.input, "fasta")}
+            for r in viz_contigs:
+                visualize_terminal_structure(
+                    contig_id     = r["contig"],
+                    seq           = seq_map.get(r["contig"], ""),
+                    evidence      = r["evidence"],
+                    bam_file      = args.bam or "",
+                    output_prefix = args.output,
+                )
+        else:
+            print("[VIZ] No contigs with IDR/TATA evidence or HIGH/MEDIUM confidence "
+                  "— no plots generated.")
 
     print("\n[DONE]")
 
