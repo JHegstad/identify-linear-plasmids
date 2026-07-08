@@ -42,6 +42,7 @@ python identify_linear_plasmids.py -i assembly.fasta \
     --bam reads.bam --gfa assembly.gfa \
     --annot prokka.gff --blast-db plsdb.fasta \
     --skani-db skani_db/sketches \
+    --amrfinder --amrfinder-organism Enterococcus_faecium \
     --ref-gc 37.5 --chromosome-contigs chr1 \
     --json
 ```
@@ -58,6 +59,13 @@ python identify_linear_plasmids.py \
     --json -o LC495616/linear_plasmid_report
 ```
 
+With a Hybracter output directory (batch mode, one sample per assembly — auto-discovers each sample's FINAL_OUTPUT FASTA, per_contig_stats.tsv, Flye/Plassembler GFA, and Hybracter's own QC'd long reads for auto-BAM-mapping; mutually exclusive with `-i`, and `--bam`/`--longread-fastq`/`--shortread-*` are not supported alongside it):
+```bash
+python identify_linear_plasmids.py --hybracter-dir hybracter_out/ \
+    --annot prokka.gff --skani-db skani_db/sketches --json -o batch_report
+```
+Produces one combined `<prefix>.tsv`/`.json` across all samples, with a `sample` column.
+
 ## Architecture
 
 Single-file script (`identify_linear_plasmids.py`) with a modular pipeline:
@@ -65,17 +73,20 @@ Single-file script (`identify_linear_plasmids.py`) with a modular pipeline:
 | Module | Function(s) | Purpose |
 |--------|-------------|---------|
 | 0 | `parse_fasta_header`, `assess_header_metadata` | Extract circular/copy-number metadata from assembler FASTA headers (Unicycler, Plassembler, Hybracter) |
-| 2 | `detect_self_complement_ends` | Detect hairpin/palindromic ends via end-window reverse-complement identity |
+| 0b | `discover_hybracter_samples`, `parse_hybracter_contig_stats` | `--hybracter-dir` batch mode: per-sample FASTA/GFA/reads discovery under a Hybracter output root |
+| 2 | `detect_terminal_hairpins` | Localized per-end hairpin/TIR fold-back detector (ported from linear-plasmid-hairpin-tools' `find_hairpins.py`, 2026-07) — replaces the old whole-window `detect_self_complement_ends`, which tested a symmetric-hairpin hypothesis that never fires on genuinely asymmetric ends (pELF1-type) |
 | 2c | `detect_coverage_drop_ends` | Detect coverage drop at contig ends via BAM (hairpin inaccessibility artefact) |
 | 3 | `gc_content`, `assess_gc` | GC% deviation from reference |
 | 4 | `classify_size` | Size range check against known linear plasmid families |
 | 5 | `parse_annotation`, `screen_genes` | Screen GFF3/Prokka TSV for linear-plasmid-associated gene keywords |
+| 5b | `run_amrfinder`, `interpret_amr_hits` | `--amrfinder`: AMR gene screening via NCBI AMRFinderPlus, run once per assembly and attributed to each contig by its `Contig id`. Reported in TSV/JSON (`amr_hit_count`/`amr_genes`/`amr_classes`) — informational only, not scored (same precedent as `resistance_genes`, commit 863d4b2) |
 | 6 | `estimate_copy_number` | BAM-based copy number relative to chromosome |
-| 7 | `parse_gfa_topology`, `is_linear_in_gfa` | GFA assembly graph linear topology detection |
+| 7 | `parse_gfa_topology`, `is_linear_in_gfa` | Strand-aware GFA topology classification (ported from linear-plasmid-hairpin-tools' `autocycler_dotplot_classify.py`, 2026-07) — walks the graph per connected component (circular/linear/fragmented) instead of the old link-degree count, which could misclassify a same-strand circular self-loop as linear evidence |
+| 7b | `annotate_gfa_hairpins` | `--annotate-gfa-hairpins`: writes Autocycler-style hairpin links into a GFA copy for Bandage visualization (diagnostic only, not scored) |
 | 8 | `run_blast`, `interpret_blast_hits` | BLAST against plasmid DB (PLSDB); two-tier scoring |
 | 9 | `compute_score` | Composite weighted scoring → confidence call (HIGH/MEDIUM/LOW/NONE) |
 
-**Scoring system**: `SCORING_WEIGHTS` dict maps evidence categories to integer weights. `CONFIDENCE_THRESHOLDS` maps HIGH ≥70, MEDIUM ≥40, LOW ≥15. `CONTIG_SPECIFIC_SCORES` lists gene-based scores that are suppressed when annotation cannot be matched per-contig. Contigs with `circular=true` in header have gene-based scoring blocked (`CIRCULAR_DISQUALIFIES_GENE_SCORING`).
+**Scoring system**: `SCORING_WEIGHTS` dict maps evidence categories to integer weights, rescaled (2026-07) so the achievable ceiling is 100 (`compute_score`'s `max_possible` accounts for the mutually-exclusive blast/skani tiers). `CONFIDENCE_THRESHOLDS` maps HIGH ≥35, MEDIUM ≥20, LOW ≥8. Two categories (`circular_flag_absent`, `self_complement_end`) were removed from scoring during revalidation — they were unreachable/non-discriminating on known-positive linear plasmids (see comments above `SCORING_WEIGHTS`). `CONTIG_SPECIFIC_SCORES` lists gene-based scores that are suppressed when annotation cannot be matched per-contig. Contigs with `circular=true` in header have gene-based scoring blocked (`CIRCULAR_DISQUALIFIES_GENE_SCORING`).
 
 **Annotation handling**: `screen_genes` tries to match the contig ID against the annotation's `contig` column. For multi-contig annotations with no match (Prokka TSV prefix ≠ FASTA header), gene scoring is skipped — use GFF3 (`--annot`) for reliable per-contig mapping.
 

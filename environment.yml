@@ -20,3 +20,4 @@ dependencies:
   - samtools
   - blast              # optional: --blast-db (PLSDB homology search)
   - skani              # optional: --skani-db (ANI-based plasmid DB search)
+  - ncbi-amrfinderplus # optional: --amrfinder (AMR gene screening; run `amrfinder -u` once to fetch the database)

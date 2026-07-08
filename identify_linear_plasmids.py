@@ -40,6 +40,8 @@ External tools (optional, for long-read mapping):
 """
 
 import argparse
+import copy
+import glob
 import json
 import math
 import os
@@ -142,33 +144,46 @@ LINEAR_PLASMID_IS = [
 ]
 
 # Scoring weights for each evidence category (Hashimoto 2019 / Boumamoud 2022 / Hashimoto 2023)
+#
+# Rescaled 2026-07 so the realistic achievable ceiling (accounting for the
+# mutually-exclusive blast_hit/blast_hit_linear_db and skani_hit/skani_hit_linear_db
+# tiers, see compute_score) is exactly 100. Two categories were removed outright
+# during revalidation against known-positive linear plasmids (pELF1 reference,
+# 51525510):
+#   - circular_flag_absent: fired on every test run regardless of true topology —
+#     it's true whenever assembler-header metadata is simply absent (e.g. any
+#     non-Unicycler input), so it rewards missing metadata as if it were evidence.
+#   - self_complement_end: tests whether the whole first/last 500bp windows are
+#     mutual reverse-complements, i.e. a *symmetric* hairpin telomere. pELF1-type
+#     plasmids have *asymmetric* ends (one hairpin, one invertron — see
+#     asymmetric_ends/detect_asymmetric_ends) and scored only 30.8% identity
+#     (chance level) on the literal pELF1 reference sequence — this metric tests
+#     the wrong biological hypothesis for the plasmids this tool targets.
 SCORING_WEIGHTS = {
-    "hairpin_end":              20,   # Hairpin/palindromic end structure
-    "asymmetric_ends":          15,   # One hairpin + one invertron end (pELF1-type, Hashimoto 2019)
-    "invertron_tp_gene":        12,   # Terminal protein gene present (invertron end)
-    "size_range":               10,   # Size consistent with known linear plasmids
-    "gc_deviation":              8,   # GC% lower than typical chromosome
-    "par_system":               10,   # ParA/ParB partition system
-    "repb_rep2":                 8,   # repB/Rep_2 superfamily replication gene (Hashimoto 2019)
-    "ftsK_parA_repB_combo":     12,   # ftsK + parA + repB co-occurrence (pELF1 signature)
-    "tas_system":                8,   # Toxin-antitoxin system
+    "hairpin_end":               8,   # Hairpin/palindromic end structure
+    "asymmetric_ends":           6,   # One hairpin + one invertron end (pELF1-type, Hashimoto 2019)
+    "invertron_tp_gene":         5,   # Terminal protein gene present (invertron end)
+    "size_range":                4,   # Size consistent with known linear plasmids
+    "gc_deviation":              4,   # GC% lower than typical chromosome
+    "par_system":                4,   # ParA/ParB partition system
+    "repb_rep2":                 4,   # repB/Rep_2 superfamily replication gene (Hashimoto 2019)
+    "ftsK_parA_repB_combo":      5,   # ftsK + parA + repB co-occurrence (pELF1 signature)
+    "tas_system":                4,   # Toxin-antitoxin system
 
-    "is_elements":               5,   # IS elements associated with linear plasmids
+    "is_elements":               2,   # IS elements associated with linear plasmids
 
-    "blast_hit":                15,   # BLAST hit to known linear plasmid db (PLSDB etc.)
-    "blast_hit_linear_db":      20,   # BLAST hit explicitly to a *linear* plasmid sequence
-    "skani_hit":                15,   # SKANI hit to known linear plasmid db
-    "skani_hit_linear_db":      20,   # SKANI hit explicitly to a *linear* plasmid sequence
-    "plasmid_finder_no_hit":     8,   # No PlasmidFinder hit (novel rep = typical of linear, H.2019)
-    "coverage_drop_ends":       10,   # Coverage drop at contig ends (hairpin inaccessibility, Hashimoto 2019)
-    "assembly_graph_linear":    15,   # Assembly graph linear topology
-    "enterococcal_markers":     12,   # pELF-specific markers
-    "copy_number_low":           5,   # ~1 copy/cell (characteristic)
-    "self_complement_end":      18,   # Reverse complement overlap at ends
+    "blast_hit":                 6,   # BLAST hit to known linear plasmid db (PLSDB etc.)
+    "blast_hit_linear_db":       8,   # BLAST hit explicitly to a *linear* plasmid sequence
+    "skani_hit":                 6,   # SKANI hit to known linear plasmid db
+    "skani_hit_linear_db":       8,   # SKANI hit explicitly to a *linear* plasmid sequence
+    "plasmid_finder_no_hit":     4,   # No PlasmidFinder hit (novel rep = typical of linear, H.2019)
+    "coverage_drop_ends":        4,   # Coverage drop at contig ends (hairpin inaccessibility, Hashimoto 2019)
+    "assembly_graph_linear":     6,   # Assembly graph linear topology
+    "enterococcal_markers":      5,   # pELF-specific markers
+    "copy_number_low":           2,   # ~1 copy/cell (characteristic)
     # ── FASTA header metadata (Unicycler / Plassembler / Hybracter output) ──
-    "assembler_not_circular":   30,   # Explicit circular=false in header
-    "circular_flag_absent":     20,   # No circular=true flag (Unicycler only sets it when confirmed)
-    "header_copy_number":        8,   # Copy number in header consistent with plasmid (~0.3–4x)
+    "assembler_not_circular":   13,   # Explicit circular=false in header
+    "header_copy_number":        4,   # Copy number in header consistent with plasmid (~0.3–4x)
 }
 
 # Scores that are ONLY valid when the annotation is contig-specific (not shared).
@@ -183,11 +198,11 @@ CONTIG_SPECIFIC_SCORES = {
 # but the gene module returns empty to prevent annotation cross-contamination.
 CIRCULAR_DISQUALIFIES_GENE_SCORING = True
 
-# Confidence thresholds
+# Confidence thresholds (against the 100-point achievable ceiling, see compute_score)
 CONFIDENCE_THRESHOLDS = {
-    "HIGH":   70,   # ≥70 points → likely linear plasmid
-    "MEDIUM": 40,   # 40–69 points → possible linear plasmid
-    "LOW":    15,   # 15–39 points → weak evidence
+    "HIGH":   35,   # ≥35 points → likely linear plasmid
+    "MEDIUM": 20,   # 20–34 points → possible linear plasmid
+    "LOW":     8,   # 8–19 points → weak evidence
 }
 
 # Loop sequences flanked by IDR arms in hairpin telomeres.
@@ -289,14 +304,17 @@ def assess_header_metadata(meta: dict, chromosome_depth: float = None,
     """
     Interpret header metadata for linear plasmid evidence.
 
-    Three tiers of assembler topology signal:
-      assembler_not_circular  (weight 30): explicit circular=false in header
-      circular_flag_absent    (weight 20): no circular=true AND size < 500 kb
-                                           (Unicycler only writes circular=true when
-                                            the contig circularises; absence = linear)
+    Assembler topology signal:
+      assembler_not_circular  (weight 13): explicit circular=false in header
       circular=true           → disqualifies gene-based scoring; not a positive signal
 
-    header_copy_number (weight 8): CN 0.3–4x consistent with plasmid
+    circular_flag_absent is still recorded (diagnostic / TSV output) but is NOT
+    scored: it is true whenever no circular= flag is present at all (e.g. any
+    non-Unicycler input, including plain reference FASTAs), so it fired on every
+    single evidence run examined during 2026-07 revalidation regardless of the
+    contig's true topology — it measures missing metadata, not linearity.
+
+    header_copy_number (weight 4): CN 0.3–4x consistent with plasmid
     """
     circ = meta["circular"]
     result = {
@@ -324,42 +342,228 @@ def assess_header_metadata(meta: dict, chromosome_depth: float = None,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MODULE 2: SELF-COMPLEMENT END ANALYSIS (hairpin / inverse duplication)
+# MODULE 0b: HYBRACTER OUTPUT DISCOVERY
 # ─────────────────────────────────────────────────────────────────────────────
+#
+# Hybracter (gbouras13/hybracter) is a single-assembler-per-sample pipeline
+# (Flye for long reads, Plassembler/Unicycler for small plasmids) — unlike
+# Autocycler's multi-assembler ensemble, there's no per-cluster voting to do;
+# each sample just has one final assembly. Confirmed directory layout (2026-07,
+# via gbouras13/hybracter and gbouras13/plassembler source):
+#   <dir>/FINAL_OUTPUT/{complete,incomplete}/{sample}_final.fasta
+#   <dir>/FINAL_OUTPUT/{complete,incomplete}/{sample}_per_contig_stats.tsv
+#     (complete only: columns contig_name, contig_type [chromosome|plasmid],
+#      length, gc, circular [True/False]; incomplete has no contig_type/circular
+#      — an incomplete assembly carries no circularity signal at all)
+#   <dir>/processing/assemblies/{sample}/assembly_graph.gfa   (Flye)
+#   <dir>/processing/plassembler/{sample}/**/*.gfa            (best-effort —
+#     plassembler runs Unicycler internally and the nested output dir name
+#     isn't stable across versions, so this is a recursive glob)
+#   <dir>/processing/qc/{sample}_filt_trim.fastq.gz           (Hybracter's own
+#     QC'd long reads — reusable for auto-BAM-mapping)
+#
+# Note: Hybracter's complete/{sample}_final.fasta already has circular=true/
+# circular=True embedded in the FASTA description for chromosome/plasmid
+# records (written by plassembler's select_best_lib.py), which the existing
+# parse_fasta_header/assess_header_metadata already reads correctly (it
+# lowercases before matching) — so no new scoring pathway is needed for the
+# circular flag. parse_hybracter_contig_stats() below is used only for
+# reliable chromosome/plasmid separation (--chromosome-contigs auto-population)
+# and as a diagnostic cross-check, not as a scoring input.
 
-def detect_self_complement_ends(seq: str, window: int = 500, min_match: int = 40) -> dict:
+def discover_hybracter_samples(hybracter_dir: str) -> list:
     """
-    Check whether the terminal window of a sequence contains self-complementary
-    structure (inverted duplication / hairpin telomere).
+    Discover per-sample assembly outputs under a Hybracter output directory.
+
+    Returns a list of dicts: {sample, complete, fasta, contig_stats_tsv,
+    flye_gfa, plassembler_gfa, longread_fastq} — the latter four are None
+    when not found.
     """
-    if len(seq) < 2 * window:
-        return {"found": False, "score": 0}
+    base = Path(hybracter_dir)
+    samples = []
+    for status in ("complete", "incomplete"):
+        final_dir = base / "FINAL_OUTPUT" / status
+        if not final_dir.is_dir():
+            continue
+        for fasta in sorted(final_dir.glob("*_final.fasta")):
+            sample = fasta.name[: -len("_final.fasta")]
 
-    left  = seq[:window].upper()
-    right = seq[-window:].upper()
-    rc_right = str(Seq(right).reverse_complement())
+            contig_stats = final_dir / f"{sample}_per_contig_stats.tsv"
 
-    matches = sum(1 for a, b in zip(left, rc_right) if a == b)
-    identity = matches / window
+            flye_gfa = base / "processing" / "assemblies" / sample / "assembly_graph.gfa"
 
-    return {
-        "found": identity >= 0.70,   # 70 % identity threshold for hairpin evidence
-        "identity": round(identity, 3),
-        "score": round(identity * 100, 1),
-    }
+            plassembler_dir = base / "processing" / "plassembler" / sample
+            plassembler_gfas = (sorted(plassembler_dir.glob("**/*.gfa"))
+                                if plassembler_dir.is_dir() else [])
+
+            longread_fastq = base / "processing" / "qc" / f"{sample}_filt_trim.fastq.gz"
+
+            samples.append({
+                "sample":           sample,
+                "complete":         status == "complete",
+                "fasta":            str(fasta),
+                "contig_stats_tsv": str(contig_stats) if contig_stats.exists() else None,
+                "flye_gfa":         str(flye_gfa) if flye_gfa.exists() else None,
+                "plassembler_gfa":  str(plassembler_gfas[0]) if plassembler_gfas else None,
+                "longread_fastq":   str(longread_fastq) if longread_fastq.exists() else None,
+            })
+    return samples
 
 
-def detect_asymmetric_ends(sc_result: dict,
+def parse_hybracter_contig_stats(tsv_path: str) -> dict:
+    """
+    Parse a Hybracter {sample}_per_contig_stats.tsv.
+
+    Returns {contig_name: {"contig_type": "chromosome"|"plasmid"|"", "length":
+    int|None, "gc": float|None, "circular": bool}}. Missing/absent file
+    returns {}.
+    """
+    if not tsv_path or not os.path.exists(tsv_path):
+        return {}
+    df = pd.read_csv(tsv_path, sep="\t")
+    out = {}
+    for _, row in df.iterrows():
+        circ_raw = str(row.get("circular", "")).strip().lower()
+        out[row["contig_name"]] = {
+            "contig_type": row.get("contig_type", "") if pd.notna(row.get("contig_type", "")) else "",
+            "length":      int(row["length"]) if pd.notna(row.get("length")) else None,
+            "gc":          float(row["gc"]) if pd.notna(row.get("gc")) else None,
+            "circular":    circ_raw == "true",
+        }
+    return out
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MODULE 2: TERMINAL HAIRPIN DETECTION (localized per-end fold-back)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Ported from linear-plasmid-hairpin-tools' find_hairpins.py (analyse_end),
+# 2026-07. Replaces the previous detect_self_complement_ends, which compared
+# the WHOLE first/last `window` bp to each other (testing whether the two ends
+# are mutual reverse-complements — a *symmetric* hairpin telomere hypothesis).
+# pELF1-type plasmids have *asymmetric* ends (one hairpin, one invertron —
+# Hashimoto 2019) and that whole-window compare scored only 30.8% identity
+# (chance level) on the literal pELF1 reference sequence: it was testing the
+# wrong hypothesis. This detector instead looks for a LOCALIZED fold-back
+# within a terminal window, independently at each end — it finds the
+# inverted-repeat symmetry axis and checks whether the outer arm reaches the
+# contig terminus, which is the actual structural signature of a hairpin
+# telomere and works correctly regardless of what the opposite end looks like.
+
+_HAIRPIN_COMP = bytes.maketrans(b"ACGTNacgtn", b"TGCANtgcan")
+
+
+def _hairpin_rev_comp(s: bytes) -> bytes:
+    return s.translate(_HAIRPIN_COMP)[::-1]
+
+
+def _analyse_hairpin_end(seq: bytes, k: int, window: int, end: str, edge_tol: int,
+                         max_kmer_hits: int = 200):
+    """
+    Look for a reverse-complement inverted repeat in the terminal window at the
+    given end ('5' or '3'). Locate the dominant symmetry axis and measure the
+    outer arm.
+
+    Returns None or dict:
+      support  : number of supporting RC k-mer pairs at the dominant axis
+      tir_span : bp spanned by the inverted repeat (both arms + loop)
+      touches  : True if the outer arm reaches the contig terminus (<= edge_tol)
+      gap      : bp from the terminus to the outer arm (0 = flush with the end)
+      arm1/arm2: (start, end) global 0-based half-open coords of each arm
+      axis     : global 0-based symmetry-axis position
+    """
+    L = len(seq)
+    if L < k:
+        return None
+    if end == "3":
+        off = max(0, L - window)
+        w = seq[off:]
+    else:  # "5"
+        off = 0
+        w = seq[:min(window, L)]
+    n = len(w)
+    if n < k:
+        return None
+
+    pos = defaultdict(list)
+    for i in range(n - k + 1):
+        pos[w[i:i + k]].append(i)
+
+    # centre (axis) -> list of (i, j) supporting pairs
+    centres = defaultdict(list)
+    for i in range(n - k + 1):
+        js = pos.get(_hairpin_rev_comp(w[i:i + k]))
+        if not js or len(js) > max_kmer_hits:
+            continue
+        for j in js:
+            if j < i:
+                continue
+            centres[(i + j + k - 1) // 2].append((i, j))
+    if not centres:
+        return None
+
+    c0 = max(centres, key=lambda c: len(centres[c]))
+    pairs = []
+    for c in (c0 - 1, c0, c0 + 1):          # allow ±1 for rounding
+        pairs += centres.get(c, [])
+    positions = set()
+    for i, j in pairs:
+        positions.add(i)
+        positions.add(j)
+    support = len(pairs)
+    minp, maxp = min(positions), max(positions)
+    tir_span = (maxp - minp) + k
+
+    lefts = [i for i, j in pairs]
+    rights = [j for i, j in pairs]
+    # arm1 = 5'-side arm, arm2 = 3'-side arm (global 0-based half-open)
+    arm1 = (off + min(lefts), off + max(lefts) + k)
+    arm2 = (off + min(rights), off + max(rights) + k)
+
+    outer_global = off + maxp + k          # 3' edge of outermost k-mer
+    inner_global = off + minp              # 5' edge of innermost k-mer
+    if end == "3":
+        gap = max(0, L - outer_global)
+        touches = gap <= edge_tol
+    else:
+        gap = max(0, inner_global)
+        touches = gap <= edge_tol
+    return {"support": support, "tir_span": tir_span,
+            "touches": touches, "gap": gap,
+            "arm1": arm1, "arm2": arm2, "axis": off + c0}
+
+
+def detect_terminal_hairpins(seq: str, k: int = 31, window: int = 50_000,
+                             min_shared: int = 25, edge_tol: int = 100) -> dict:
+    """
+    Detect a terminal hairpin/TIR fold-back independently at each end of `seq`.
+
+    Returns {"left": {...} | None, "right": {...} | None} — an end's entry is
+    populated only if a fold-back with >= min_shared supporting k-mer pairs is
+    found AND it reaches the contig terminus (within edge_tol bp).
+    """
+    seq_b = seq.upper().encode("ascii", "replace")
+    out = {"left": None, "right": None}
+    for end, key in (("5", "left"), ("3", "right")):
+        r = _analyse_hairpin_end(seq_b, k, window, end, edge_tol)
+        if r is not None and r["support"] >= min_shared and r["touches"]:
+            out[key] = r
+    return out
+
+
+def detect_asymmetric_ends(hairpin_ends: dict,
                            gene_hits: dict,
                            cov_result: dict = None) -> dict:
     """
-    pELF1 has ASYMMETRIC ends: left = hairpin, right = invertron (terminal protein).
-    This is a unique indicator of the pELF lineage (Hashimoto 2019).
+    pELF1 has ASYMMETRIC ends: one end is a hairpin, the other an invertron
+    (terminal protein). This is a unique indicator of the pELF lineage
+    (Hashimoto 2019).
 
     Two detection paths — either is sufficient:
 
     Sequence + gene:
-      - Self-complementary hairpin at one end (detect_self_complement_ends) AND
+      - Terminal hairpin fold-back at exactly one end (detect_terminal_hairpins)
+        — not both, which would be a symmetric telomere type instead — AND
       - Terminal protein gene annotated
 
     BAM coverage (most diagnostic with Illumina reads):
@@ -368,9 +572,11 @@ def detect_asymmetric_ends(sc_result: dict,
       A symmetric drop at both ends does NOT count — that could be any palindromic
       structure, not the pELF1-specific asymmetry.
     """
-    has_hairpin = sc_result.get("found")
+    left_hairpin  = hairpin_ends.get("left") is not None
+    right_hairpin = hairpin_ends.get("right") is not None
+    has_hairpin = left_hairpin or right_hairpin
     has_tp_gene = bool(gene_hits.get("terminal_protein_genes"))
-    seq_asymmetric = has_hairpin and has_tp_gene
+    seq_asymmetric = (left_hairpin != right_hairpin) and has_tp_gene
 
     cov = cov_result or {}
     bam_asymmetric = (cov.get("available") and
@@ -838,6 +1044,136 @@ def screen_genes(annot_df: pd.DataFrame, contig_id: str) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# MODULE 5b: AMRFINDERPLUS SCREENING (antimicrobial resistance genes)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Reports AMR gene content per contig using NCBI's AMRFinderPlus (`amrfinder`
+# CLI + its curated reference database — bioconda: ncbi-amrfinderplus).
+# Opt-in via --amrfinder; run once on the whole assembly (nucleotide mode,
+# -n) and attributed back to each contig by AMRFinderPlus's own "Contig id"
+# column, rather than re-run per contig.
+#
+# Informational only — NOT scored. This follows the same precedent as the
+# keyword-based `resistance_genes` category (commit 863d4b2, "Remove
+# antibiotic resistance genes from scoring"): AMR content doesn't discriminate
+# linear vs circular topology, so it's reported in the TSV/JSON but does not
+# contribute to SCORING_WEIGHTS/compute_score.
+
+# Column-name variants seen across AMRFinderPlus versions — resolved
+# case-insensitively by substring so minor header changes don't break parsing.
+_AMR_COLUMN_ALIASES = {
+    "contig":   ["contig id", "contig identifier"],
+    "gene":     ["gene symbol", "element symbol"],
+    "product":  ["sequence name", "element name"],
+    "type":     ["element type", "type"],
+    "subtype":  ["element subtype", "subtype"],
+    "class":    ["class"],
+    "subclass": ["subclass"],
+    "identity": ["% identity to reference sequence", "% identity to reference"],
+    "coverage": ["% coverage of reference sequence", "% coverage of reference"],
+    "start":    ["start"],
+    "stop":     ["stop"],
+}
+
+
+def _resolve_amr_columns(columns) -> dict:
+    """Map our canonical field names to whatever AMRFinderPlus actually named
+    the column in this run (case-insensitive exact match against known
+    aliases). Missing fields are simply absent from the returned dict."""
+    lower_cols = {c.lower(): c for c in columns}
+    resolved = {}
+    for field, aliases in _AMR_COLUMN_ALIASES.items():
+        for alias in aliases:
+            if alias in lower_cols:
+                resolved[field] = lower_cols[alias]
+                break
+    return resolved
+
+
+def run_amrfinder(assembly_fasta: str, out_file: str, db: str = None,
+                  organism: str = None, threads: int = 4) -> pd.DataFrame:
+    """
+    Run AMRFinderPlus in nucleotide mode on the whole assembly FASTA.
+    Returns a DataFrame with canonical columns (contig, gene, product, type,
+    subtype, class, subclass, identity, coverage, start, stop) — a subset may
+    be missing if AMRFinderPlus's output didn't include them. Empty DataFrame
+    if the tool isn't on PATH, the run fails, or there are no hits.
+    """
+    if not os.path.exists(assembly_fasta):
+        return pd.DataFrame()
+
+    cmd = ["amrfinder", "-n", assembly_fasta, "-o", out_file,
+           "--threads", str(threads)]
+    if db:
+        cmd += ["-d", db]
+    if organism:
+        cmd += ["-O", organism]
+
+    try:
+        subprocess.run(cmd, check=True, capture_output=True)
+    except (subprocess.CalledProcessError, FileNotFoundError) as e:
+        print(f"[WARN] amrfinder failed or not found on PATH ({e}); "
+              f"skipping AMR screening.", file=sys.stderr)
+        return pd.DataFrame()
+
+    if not os.path.exists(out_file) or os.path.getsize(out_file) == 0:
+        return pd.DataFrame()
+
+    try:
+        raw = pd.read_csv(out_file, sep="\t")
+    except Exception:
+        return pd.DataFrame()
+    if raw.empty:
+        return pd.DataFrame()
+
+    cols = _resolve_amr_columns(raw.columns)
+    if "contig" not in cols:
+        print("[WARN] amrfinder output missing a recognisable Contig id "
+              "column; skipping AMR screening.", file=sys.stderr)
+        return pd.DataFrame()
+
+    df = pd.DataFrame({field: raw[col] for field, col in cols.items()})
+    return df
+
+
+def interpret_amr_hits(amr_df: pd.DataFrame, contig_id: str) -> dict:
+    """Summarise AMRFinderPlus hits for one contig."""
+    if amr_df is None or amr_df.empty:
+        return {"available": amr_df is not None, "hits": 0,
+                "genes": [], "classes": [], "elements": []}
+
+    subset = amr_df[amr_df["contig"].astype(str) == str(contig_id)]
+    if subset.empty:
+        return {"available": True, "hits": 0, "genes": [], "classes": [],
+                "elements": []}
+
+    elements = []
+    for _, row in subset.iterrows():
+        elements.append({
+            "gene":     row.get("gene", ""),
+            "product":  row.get("product", ""),
+            "type":     row.get("type", ""),
+            "subtype":  row.get("subtype", ""),
+            "class":    row.get("class", ""),
+            "subclass": row.get("subclass", ""),
+            "identity": row.get("identity", None),
+            "coverage": row.get("coverage", None),
+            "start":    row.get("start", None),
+            "stop":     row.get("stop", None),
+        })
+
+    return {
+        "available": True,
+        "hits":      len(subset),
+        "genes":     sorted(subset["gene"].dropna().astype(str).unique().tolist())
+                    if "gene" in subset else [],
+        "classes":   sorted(subset["class"].dropna().astype(str).unique().tolist())
+                    if "class" in subset else [],
+        "elements":  elements,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # MODULE 6: COPY NUMBER ESTIMATION (from BAM coverage)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -905,12 +1241,144 @@ def estimate_copy_number(bam_file, contig_id: str,
 # MODULE 7: ASSEMBLY GRAPH TOPOLOGY (GFA parsing)
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Strand-aware GFA graph classifier, ported from linear-plasmid-hairpin-tools'
+# autocycler_dotplot_classify.py (2026-07). Not actually Autocycler-specific —
+# it only needs standard S/L lines, so it works on Flye's assembly_graph.gfa
+# and Unicycler/Plassembler's assembly.gfa too. Replaces the previous
+# link-degree-counting parser, which had a real bug: a genuinely circular
+# single-contig self-loop (same-strand self-link, `L 1 + 1 +`) has 2
+# link-table entries with 1 partner, landing in the same "tir_like" bucket as
+# a true open-ended terminal-inverted-repeat linear contig — i.e. it could
+# misclassify a circular replicon as linear evidence. The component-walk
+# below distinguishes a closed circular loop from a hairpin self-link
+# (opposite-strand, `L 1 + 1 -`) from a genuinely open/fragmented graph by
+# actually walking the strand-aware links, not just counting them.
+
+def _gfa_parse_segments_links(gfa_file: str):
+    """Parse S/L lines only. Returns (segments: {id: length}, links: set of
+    (from_seg, from_strand, to_seg, to_strand))."""
+    segments = {}
+    links = set()
+    with open(gfa_file) as fh:
+        for line in fh:
+            if not line:
+                continue
+            t = line[0]
+            if t not in "SL":
+                continue
+            f = line.rstrip("\n").split("\t")
+            if t == "S" and len(f) >= 3:
+                seg = f[1]
+                seq = f[2]
+                length = 0
+                if seq and seq != "*":
+                    length = len(seq)
+                else:
+                    for tag in f[3:]:
+                        if tag.startswith("LN:i:"):
+                            try:
+                                length = int(tag[5:])
+                            except ValueError:
+                                pass
+                segments[seg] = length
+            elif t == "L" and len(f) >= 5:
+                links.add((f[1], f[2], f[3], f[4]))
+    for (a, _, b, _) in links:
+        segments.setdefault(a, 0)
+        segments.setdefault(b, 0)
+    return segments, links
+
+
+def _gfa_build_adjacency(links):
+    fnext = defaultdict(list)   # leaving u on '+'  -> list of (to, to_strand)
+    rnext = defaultdict(list)   # leaving u on '-'  -> list of (to, to_strand)
+    fprev = defaultdict(int)    # links arriving at u on '+'
+    rprev = defaultdict(int)    # links arriving at u on '-'
+    undirected = defaultdict(set)
+    for (a, sa, b, sb) in links:
+        (fnext if sa == "+" else rnext)[a].append((b, sb))
+        if sb == "+":
+            fprev[b] += 1
+        else:
+            rprev[b] += 1
+        undirected[a].add(b)
+        undirected[b].add(a)
+    return fnext, rnext, fprev, rprev, undirected
+
+
+def _gfa_connected_components(segments, undirected):
+    visited, comps = set(), []
+    for seg in segments:
+        if seg in visited:
+            continue
+        stack, comp = [seg], []
+        while stack:
+            cur = stack.pop()
+            if cur in visited:
+                continue
+            visited.add(cur)
+            comp.append(cur)
+            for nb in undirected.get(cur, ()):
+                if nb not in visited:
+                    stack.append(nb)
+        comps.append(sorted(comp))
+    return sorted(comps)
+
+
+def _gfa_component_is_circular_loop(component, fnext, rnext, fprev, rprev) -> bool:
+    """Start at the lowest-numbered unitig on the forward strand and walk
+    forward links; every unitig on the loop must have exactly one link on
+    each of its four sides, and the walk must return to the start after
+    covering the whole component."""
+    if not component:
+        return False
+    first = component[0]
+    num, strand = first, "+"
+    visited = set()
+    while num != first or not visited:
+        if num in visited:
+            return False
+        visited.add(num)
+        if (len(fnext.get(num, [])) != 1 or len(rnext.get(num, [])) != 1 or
+                fprev.get(num, 0) != 1 or rprev.get(num, 0) != 1):
+            return False
+        nxt = fnext[num][0] if strand == "+" else rnext[num][0]
+        num, strand = nxt
+    return len(visited) == len(component)
+
+
+def _gfa_classify_components(segments, links):
+    """Classify every connected component of the graph.
+    Returns list of dicts: {'segs','length','topology','hairpin'}
+    topology in {'circular','linear','fragmented'}."""
+    fnext, rnext, fprev, rprev, undirected = _gfa_build_adjacency(links)
+    out = []
+    for comp in _gfa_connected_components(segments, undirected):
+        cset = set(comp)
+        length = sum(segments.get(s, 0) for s in comp)
+        hp = any(a == b and sa != sb for (a, sa, b, sb) in links if a in cset)
+        touches = any((a in cset or b in cset) for (a, _, b, _) in links)
+        if _gfa_component_is_circular_loop(comp, fnext, rnext, fprev, rprev):
+            topo = "circular"
+        elif len(comp) == 1 and not touches:
+            topo = "linear"          # isolated unitig, open ends
+        elif len(comp) == 1:
+            topo = "linear"          # single unitig with a hairpin link
+        else:
+            topo = "fragmented"      # several unitigs, not a clean loop
+        out.append({"segs": comp, "length": length, "topology": topo,
+                    "hairpin": hp})
+    return out
+
+
 def parse_gfa_topology(gfa_file: str, length_map: dict = None) -> dict:
     """
-    Parse a GFA assembly graph (Unicycler/Plassembler output) to detect linear
-    contig topology signatures (open ends, isolated contigs).
+    Parse a GFA assembly graph (Flye/Unicycler/Plassembler output) and
+    classify each segment's connected component as circular / linear /
+    fragmented, walking the strand-aware graph rather than just counting
+    link degree (see module comment above).
 
-    Returns a dict: contig_id → topology_info.
+    Returns a dict: contig_id → {"topology": ..., "hairpin": bool}.
 
     length_map: optional {contig_id: seq_length} built from FASTA records.
     When GFA segment names differ from FASTA contig IDs (e.g. Plassembler
@@ -920,46 +1388,14 @@ def parse_gfa_topology(gfa_file: str, length_map: dict = None) -> dict:
     if not gfa_file or not os.path.exists(gfa_file):
         return {}
 
-    links = defaultdict(list)   # node → [(other_node, orientation)]
-    segments = set()
-    seg_lengths = {}             # seg_name → int length
-
-    with open(gfa_file) as fh:
-        for line in fh:
-            parts = line.strip().split("\t")
-            if parts[0] == "S":
-                seg = parts[1]
-                segments.add(seg)
-                seq = parts[2] if len(parts) > 2 else "*"
-                ln = len(seq) if seq != "*" else 0
-                for tag in parts[3:]:
-                    if tag.startswith("LN:i:"):
-                        ln = int(tag[5:])
-                        break
-                if ln:
-                    seg_lengths[seg] = ln
-            elif parts[0] == "L":
-                if len(parts) >= 5:
-                    src, src_o, dst, dst_o = parts[1], parts[2], parts[3], parts[4]
-                    links[src].append((dst, src_o, dst_o))
-                    links[dst].append((src, dst_o, src_o))
+    segments, links = _gfa_parse_segments_links(gfa_file)
+    seg_lengths = {seg: ln for seg, ln in segments.items() if ln}
+    components = _gfa_classify_components(segments, links)
 
     topology = {}
-    for seg in segments:
-        connected = links[seg]
-        n_links = len(connected)
-        if n_links == 0:
-            topology[seg] = "isolated"
-        elif n_links == 1:
-            topology[seg] = "linear_end"
-        elif n_links == 2:
-            partners = {c[0] for c in connected}
-            if len(partners) == 1:
-                topology[seg] = "tir_like"
-            else:
-                topology[seg] = "linear_middle_or_circular"
-        else:
-            topology[seg] = "complex"
+    for comp in components:
+        for seg in comp["segs"]:
+            topology[seg] = {"topology": comp["topology"], "hairpin": comp["hairpin"]}
 
     if length_map:
         # Build inverse: length → contig_id, skipping any ambiguous lengths
@@ -985,20 +1421,97 @@ def parse_gfa_topology(gfa_file: str, length_map: dict = None) -> dict:
 
 def is_linear_in_gfa(contig_id: str, gfa_topology: dict) -> dict:
     """Interpret GFA topology for a specific contig."""
-    topo = gfa_topology.get(contig_id, "unknown")
-    is_linear = topo in ("linear_end", "isolated", "tir_like")
+    entry = gfa_topology.get(contig_id)
+    topo = entry["topology"] if entry else "unknown"
+    hairpin = entry["hairpin"] if entry else False
+    is_linear = topo == "linear"
+    desc = {
+        "circular":   "Component forms a closed circular loop",
+        "linear":     "Open-ended component" + (" with a hairpin self-link" if hairpin else ""),
+        "fragmented": "Multiple unitigs that do not form a clean loop — ambiguous",
+        "unknown":    "Contig not in GFA",
+    }.get(topo, "unknown")
     return {
         "topology": topo,
+        "hairpin": hairpin,
         "consistent_with_linear": is_linear,
-        "description": {
-            "linear_end":     "Contig has open end(s) — strong linear indicator",
-            "isolated":       "No graph links — may be linear or very distinct",
-            "tir_like":       "Both ends link to same partner — TIR structure detected",
-            "complex":        "Multiple connections — branching / repeat region",
-            "linear_middle_or_circular": "Two distinct partners — could be circular",
-            "unknown":        "Contig not in GFA",
-        }.get(topo, "unknown"),
+        "description": desc,
     }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MODULE 7b: GFA HAIRPIN-EDGE ANNOTATION (diagnostic, Bandage-facing)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Ported from linear-plasmid-hairpin-tools' add_hairpin_edges.py (2026-07).
+# Detects a terminal fold-back on each segment of a raw assembler GFA (Flye's
+# assembly_graph.gfa, Unicycler/Plassembler's assembly.gfa) and appends the
+# same hairpin link Autocycler uses to represent one:
+#   3' fold-back  ->  L <seg> + <seg> - 0M
+#   5' fold-back  ->  L <seg> - <seg> + 0M
+# This is an ANNOTATION only — it adds the link but does not alter segment
+# sequences or split the contig at the fold apex, so it is correct for
+# detection/visualization (Bandage, this script's own gfa_topology module)
+# but not a length-accurate assembly-graph rebuild. It does not feed scoring.
+
+def annotate_gfa_hairpins(gfa_path: str, out_path: str = None,
+                          k: int = 31, window: int = 50_000,
+                          min_shared: int = 25, edge_tol: int = 100,
+                          overlap: bool = False) -> dict:
+    """
+    Detect terminal hairpins in `gfa_path`'s segments and write a copy with
+    Autocycler-style hairpin links added.
+
+    Returns {"out_path": str | None, "n_added": int, "links": [...]}.
+    out_path is None if no hairpins were found (nothing written).
+    """
+    lines = []
+    seqs = {}
+    existing_links = set()
+    with open(gfa_path) as fh:
+        for line in fh:
+            lines.append(line.rstrip("\n"))
+            if line[:1] == "S":
+                f = line.rstrip("\n").split("\t")
+                if len(f) >= 3 and f[2] != "*":
+                    seqs[f[1]] = f[2].encode("ascii", "replace").upper()
+            elif line[:1] == "L":
+                f = line.rstrip("\n").split("\t")
+                if len(f) >= 5:
+                    existing_links.add((f[1], f[2], f[3], f[4]))
+
+    new_links = []   # (seg, from_strand, to_strand, overlap_str, info_dict)
+    for seg, seq in seqs.items():
+        for end in ("5", "3"):
+            r = _analyse_hairpin_end(seq, k, window, end, edge_tol)
+            if r is None or r["support"] < min_shared or not r["touches"]:
+                continue
+            # 3' fold -> L seg + seg - ; 5' fold -> L seg - seg +
+            sa, sb = ("+", "-") if end == "3" else ("-", "+")
+            if (seg, sa, seg, sb) in existing_links:
+                continue
+            arm1_s, arm1_e = r["arm1"]
+            arm2_s, arm2_e = r["arm2"]
+            arm_len = min(arm1_e - arm1_s, arm2_e - arm2_s)
+            ov = f"{arm_len}M" if overlap else "0M"
+            new_links.append((seg, sa, sb, ov,
+                              {"segment": seg, "end": f"{end}'", "arm_len": arm_len,
+                               "gap": r["gap"], "support": r["support"],
+                               "seg_len": len(seq)}))
+            existing_links.add((seg, sa, seg, sb))
+
+    if not new_links:
+        return {"out_path": None, "n_added": 0, "links": []}
+
+    out = out_path or (os.path.splitext(gfa_path)[0] + ".hairpins.gfa")
+    with open(out, "w") as fh:
+        for ln in lines:
+            fh.write(ln + "\n")
+        for seg, sa, sb, ov, _info in new_links:
+            fh.write(f"L\t{seg}\t{sa}\t{seg}\t{sb}\t{ov}\n")
+
+    return {"out_path": out, "n_added": len(new_links),
+            "links": [info for *_, info in new_links]}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1158,27 +1671,24 @@ def compute_score(evidence: dict) -> dict:
     if hdr.get("assembler_not_circular"):
         score += SCORING_WEIGHTS["assembler_not_circular"]
         breakdown["assembler_not_circular"] = SCORING_WEIGHTS["assembler_not_circular"]
-    elif hdr.get("circular_flag_absent"):
-        # No circular=true on a plasmid-sized contig — Unicycler/Plassembler would
-        # have written it if the contig circularised; absence is a linear indicator
-        score += SCORING_WEIGHTS["circular_flag_absent"]
-        breakdown["circular_flag_absent"] = SCORING_WEIGHTS["circular_flag_absent"]
+    # circular_flag_absent is NOT scored (see assess_header_metadata docstring) —
+    # it fires whenever header metadata is simply missing, not when linearity is
+    # actually confirmed, so it carries no discriminating evidence value.
 
     if hdr.get("header_cn_consistent") and not hdr.get("high_copy_circular"):
         score += SCORING_WEIGHTS["header_copy_number"]
         breakdown["header_copy_number"] = SCORING_WEIGHTS["header_copy_number"]
 
-    # 1. Hairpin / self-complement (broad: left ≈ RC(right) over 500 bp)
-    sc = evidence.get("self_complement", {})
-    if sc.get("found"):
-        score += SCORING_WEIGHTS["self_complement_end"]
-        breakdown["self_complement_end"] = SCORING_WEIGHTS["self_complement_end"]
-
-    # 1b. Confirmed IDR/TATA hairpin telomere (specific: arm + known loop motif)
-    # Requires detect_idr_tata_ends to confirm arm+loop structure — mere TATA
-    # bases at the tip are insufficient without the flanking IDR arms.
+    # 1b. Hairpin telomere at either end — either signal is sufficient:
+    #   - confirmed_idr_tata: specific (arm + known loop motif, e.g. TATA)
+    #   - hairpin_ends (detect_terminal_hairpins): general localized fold-back
+    #     detector (ported from find_hairpins.py, 2026-07) — finds the
+    #     inverted-repeat symmetry axis per end and requires the outer arm to
+    #     reach the contig terminus. Correctly handles asymmetric ends (only
+    #     one end needs to fold back), unlike the old whole-window compare.
     idr = evidence.get("idr_tata", {})
-    if idr.get("confirmed_idr_tata"):
+    hairpin_ends = evidence.get("hairpin_ends", {})
+    if idr.get("confirmed_idr_tata") or hairpin_ends.get("left") or hairpin_ends.get("right"):
         score += SCORING_WEIGHTS["hairpin_end"]
         breakdown["hairpin_end"] = SCORING_WEIGHTS["hairpin_end"]
 
@@ -1295,7 +1805,13 @@ def compute_score(evidence: dict) -> dict:
     else:
         confidence = "NONE"
 
-    max_score = sum(SCORING_WEIGHTS.values())
+    # blast_hit/blast_hit_linear_db and skani_hit/skani_hit_linear_db are each
+    # mutually exclusive (elif above) — only the higher tier of each pair can
+    # ever be reached, so the lower tier's weight must not count toward the
+    # achievable ceiling.
+    max_score = (sum(SCORING_WEIGHTS.values())
+                 - min(SCORING_WEIGHTS["blast_hit"], SCORING_WEIGHTS["blast_hit_linear_db"])
+                 - min(SCORING_WEIGHTS["skani_hit"], SCORING_WEIGHTS["skani_hit_linear_db"]))
     return {
         "total_score": score,
         "max_possible": max_score,
@@ -1705,7 +2221,7 @@ def visualize_terminal_structure(contig_id: str, seq: str, evidence: dict,
     seq_len = len(seq)
     idr  = evidence.get("idr_tata", {})
     cov  = evidence.get("coverage_drop", {})
-    sc   = evidence.get("self_complement", {})
+    hp   = evidence.get("hairpin_ends", {})
     sc_r = evidence.get("score", {})
 
     has_bam = bool(bam_file and os.path.exists(bam_file))
@@ -1872,9 +2388,12 @@ def visualize_terminal_structure(contig_id: str, seq: str, evidence: dict,
                     f"IDR {side}  {arm_len} bp  {identity:.0%}  {marker}",
                     ha="center", va="bottom", fontsize=8, color=col)
 
-    sc_id = sc.get("identity", 0.0)
+    hp_left  = hp.get("left")
+    hp_right = hp.get("right")
+    hp_desc = (f"hairpin left: {'support=' + str(hp_left['support']) if hp_left else 'no'}   "
+              f"hairpin right: {'support=' + str(hp_right['support']) if hp_right else 'no'}")
     ax_str.text(seq_len / 2, arm_y - 0.68,
-                f"SC identity (500 bp): {sc_id:.1%}   "
+                f"{hp_desc}   "
                 f"IDR left: {idr.get('left', {}).get('confirmed', False)}   "
                 f"IDR right: {idr.get('right', {}).get('confirmed', False)}",
                 ha="center", va="center", fontsize=7.5, color="dimgray")
@@ -1907,12 +2426,16 @@ def visualize_terminal_structure(contig_id: str, seq: str, evidence: dict,
 
 def analyse_contig(record, args, annot_df, gfa_topology, ref_gc=None,
                    chromosome_depth: float = None,
-                   bam_handle=None) -> dict:
+                   bam_handle=None, amr_df: pd.DataFrame = None) -> dict:
     """Run all modules on a single contig/sequence record.
 
     bam_handle: optional open pysam.AlignmentFile shared across contigs.
     When provided it is used for coverage/copy-number analysis without
     re-opening the BAM per contig; the caller is responsible for closing it.
+
+    amr_df: optional AMRFinderPlus hits for the whole assembly (from
+    run_amrfinder, run once per assembly by run_single_assembly), filtered
+    here to this contig's hits. None means AMR screening wasn't requested.
     """
     seq = str(record.seq)
     cid = record.id
@@ -1925,7 +2448,12 @@ def analyse_contig(record, args, annot_df, gfa_topology, ref_gc=None,
         header_meta, chromosome_depth, seq_len=len(seq))
 
     # Structural (hairpin, invertron end)
-    evidence["self_complement"] = detect_self_complement_ends(seq)
+    evidence["hairpin_ends"] = detect_terminal_hairpins(
+        seq,
+        k=getattr(args, "hairpin_k", 31),
+        window=getattr(args, "hairpin_window", 50_000),
+        min_shared=getattr(args, "hairpin_min_shared", 25),
+        edge_tol=getattr(args, "hairpin_edge_tol", 100))
     evidence["idr_tata"]        = detect_idr_tata_ends(seq)
     evidence["size"]            = classify_size(len(seq))
 
@@ -1935,6 +2463,9 @@ def analyse_contig(record, args, annot_df, gfa_topology, ref_gc=None,
 
     # Gene content
     evidence["genes"] = screen_genes(annot_df, cid) if not annot_df.empty else {}
+
+    # AMRFinderPlus hits (informational only — not scored, see module comment)
+    evidence["amr"] = interpret_amr_hits(amr_df, cid)
 
     # PlasmidFinder no-hit flag (set externally; default False unless --no-plasmid-finder-hit)
     evidence["plasmid_finder_no_hit"] = getattr(args, "plasmid_finder_no_hit", False)
@@ -1953,7 +2484,7 @@ def analyse_contig(record, args, annot_df, gfa_topology, ref_gc=None,
     # Asymmetric end analysis (pELF1-type, Hashimoto 2019)
     # Runs after BAM so coverage_drop is available for the left-only drop path
     evidence["asymmetric_ends"] = detect_asymmetric_ends(
-        evidence["self_complement"],
+        evidence["hairpin_ends"],
         evidence.get("genes", {}),
         evidence.get("coverage_drop"))
 
@@ -2008,127 +2539,15 @@ def analyse_contig(record, args, annot_df, gfa_topology, ref_gc=None,
     return {"contig": cid, "length": len(seq), "gc": contig_gc, "evidence": evidence}
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Identify linear plasmids in assembled sequences",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=__doc__,
-    )
-    parser.add_argument("-i", "--input",   required=True,
-                        help="Input FASTA file (assembled sequences)")
-    parser.add_argument("-o", "--output",  default="linear_plasmid_report",
-                        help="Output prefix (default: linear_plasmid_report)")
-    parser.add_argument("--bam",           help="Pre-mapped BAM file of reads aligned to assembly")
-    parser.add_argument("--longread-fastq", dest="longread_fastq",
-                        help="Long-read FASTQ (or .fastq.gz) — mapped automatically "
-                             "with minimap2 to produce a BAM for IDR and coverage analysis")
-    parser.add_argument("--longread-preset", dest="longread_preset",
-                        default="map-ont",
-                        choices=["map-ont", "map-pb", "map-hifi"],
-                        help="minimap2 preset for long reads "
-                             "(map-ont Nanopore, map-pb PacBio CLR, map-hifi PacBio HiFi; "
-                             "default: map-ont)")
-    parser.add_argument("--longread-threads", dest="longread_threads",
-                        type=int, default=4,
-                        help="Threads for minimap2 / samtools (default: 4)")
-    parser.add_argument("--shortread-fastq", dest="shortread_fastq",
-                        metavar="INTERLEAVED.fastq.gz",
-                        help="Interleaved paired-end Illumina FASTQ — mapped with "
-                             "minimap2 sr preset; produces <output-prefix>.short.sorted.bam")
-    parser.add_argument("--shortread-r1", dest="shortread_r1",
-                        metavar="R1.fastq.gz",
-                        help="Illumina R1 FASTQ (paired-end, separate files)")
-    parser.add_argument("--shortread-r2", dest="shortread_r2",
-                        metavar="R2.fastq.gz",
-                        help="Illumina R2 FASTQ (paired-end, separate files)")
-    parser.add_argument("--shortread-threads", dest="shortread_threads",
-                        type=int, default=4,
-                        help="Threads for minimap2 / samtools short-read mapping "
-                             "(default: 4)")
-    parser.add_argument("--gfa",           help="Assembly graph GFA file (Unicycler)")
-    parser.add_argument("--annot",         help="GFF3/TSV annotation file (Prokka)")
-    parser.add_argument("--blast-db",      help="BLAST database path (e.g. PLSDB)")
-    parser.add_argument("--blast-identity", type=float, default=70.0,
-                        help="Minimum BLAST %%identity (default: 70)")
-    parser.add_argument("--skani-db",
-                        help="SKANI database: pre-sketched directory or FASTA file. "
-                             "For large FASTA DBs, pre-sketch with: "
-                             "skani sketch -l db.fna -o db_dir/")
-    parser.add_argument("--skani-ani", type=float, default=90.0,
-                        help="Minimum SKANI ANI %%%% (default: 90)")
-    parser.add_argument("--skani-af",  type=float, default=0.05,
-                        help="Minimum SKANI query alignment fraction (default: 0.05)")
-    parser.add_argument("--chromosome-contigs", nargs="*", default=[],
-                        help="Contig IDs of chromosome (for copy number normalisation)")
-    parser.add_argument("--ref-gc", type=float, default=None,
-                        help="Reference GC%% of chromosome (for GC deviation scoring)")
-    parser.add_argument("--min-length", type=int, default=5_000,
-                        help="Minimum contig length to analyse (default: 5000 bp)")
-    parser.add_argument("--min-score", type=int, default=15,
-                        help="Minimum score to report (default: 15)")
-    parser.add_argument("--no-plasmid-finder-hit", action="store_true",
-                        dest="plasmid_finder_no_hit",
-                        help="Flag: PlasmidFinder found no replicon hit "
-                             "(positive linear plasmid indicator, Hashimoto 2019)")
-    parser.add_argument("--json", action="store_true",
-                        help="Also write detailed JSON output")
-    parser.add_argument("--visualize", action="store_true",
-                        help="Generate Figure-3-style left-end visualization (PNG) for "
-                             "contigs with IDR/TATA evidence (requires matplotlib)")
-    args = parser.parse_args()
+def run_single_assembly(args) -> list:
+    """
+    Run the full pipeline on one assembly FASTA (args.input) and return the
+    filtered/sorted list of per-contig result dicts, as consumed by the TSV/
+    JSON writers and visualize_terminal_structure in main().
 
-    # ── Validate short-read arguments ─────────────────────────────────────────
-    _sr_interleaved = getattr(args, "shortread_fastq", None)
-    _sr_r1          = getattr(args, "shortread_r1", None)
-    _sr_r2          = getattr(args, "shortread_r2", None)
-
-    if _sr_interleaved and (_sr_r1 or _sr_r2):
-        parser.error("--shortread-fastq (interleaved) and --shortread-r1/r2 "
-                     "are mutually exclusive.")
-    if bool(_sr_r1) != bool(_sr_r2):
-        parser.error("--shortread-r1 and --shortread-r2 must be supplied together.")
-
-    # ── Auto-map long reads if --longread-fastq supplied ─────────────────────
-    if args.longread_fastq:
-        if args.bam:
-            print("[WARN] Both --bam and --longread-fastq supplied; "
-                  "--bam takes precedence, skipping mapping.", file=sys.stderr)
-        else:
-            bam_out = f"{args.output}.sorted.bam"
-            mapped = map_longreads(
-                fastq          = args.longread_fastq,
-                assembly_fasta = args.input,
-                output_bam     = bam_out,
-                preset         = args.longread_preset,
-                threads        = args.longread_threads,
-            )
-            if mapped:
-                args.bam = mapped
-            else:
-                print("[WARN] Long-read mapping failed; continuing without BAM.",
-                      file=sys.stderr)
-
-    # ── Auto-map short reads if --shortread-fastq / --shortread-r1/r2 given ──
-    if _sr_interleaved or _sr_r1:
-        if args.bam:
-            print("[WARN] --bam already set; skipping short-read mapping "
-                  "(--bam takes precedence).", file=sys.stderr)
-        else:
-            bam_out = f"{args.output}.short.sorted.bam"
-            mapped = map_shortreads(
-                assembly_fasta = args.input,
-                output_bam     = bam_out,
-                interleaved    = _sr_interleaved,
-                r1             = _sr_r1,
-                r2             = _sr_r2,
-                threads        = args.shortread_threads,
-            )
-            if mapped:
-                args.bam = mapped
-            else:
-                print("[WARN] Short-read mapping failed; continuing without BAM.",
-                      file=sys.stderr)
-
+    Extracted from main() (2026-07) so --hybracter-dir batch mode can call it
+    once per discovered sample.
+    """
     # Load sequences
     records = list(SeqIO.parse(args.input, "fasta"))
     print(f"[INFO] Loaded {len(records)} sequences from {args.input}")
@@ -2148,6 +2567,33 @@ def main():
     gfa_topology = parse_gfa_topology(args.gfa, length_map) if args.gfa else {}
     if gfa_topology:
         print(f"[INFO] Loaded GFA topology: {len(gfa_topology)} segments")
+
+    if args.gfa and getattr(args, "annotate_gfa_hairpins", False):
+        ann = annotate_gfa_hairpins(
+            args.gfa, k=getattr(args, "hairpin_k", 31),
+            window=getattr(args, "hairpin_window", 50_000),
+            min_shared=getattr(args, "hairpin_min_shared", 25),
+            edge_tol=getattr(args, "hairpin_edge_tol", 100))
+        if ann["n_added"]:
+            print(f"[INFO] Annotated {ann['n_added']} hairpin link(s) → {ann['out_path']}")
+        else:
+            print("[INFO] --annotate-gfa-hairpins: no terminal hairpins detected in GFA segments")
+
+    # AMRFinderPlus — run once on the whole assembly (nucleotide mode), hits
+    # attributed back to each contig via its own Contig id column
+    amr_df = None
+    if getattr(args, "amrfinder", False):
+        amr_out = f"{args.output}.amrfinder.tsv"
+        amr_df = run_amrfinder(
+            args.input, amr_out,
+            db=getattr(args, "amrfinder_db", None),
+            organism=getattr(args, "amrfinder_organism", None),
+            threads=getattr(args, "amrfinder_threads", 4))
+        if not amr_df.empty:
+            print(f"[INFO] AMRFinderPlus: {len(amr_df)} hit(s) across "
+                  f"{amr_df['contig'].nunique()} contig(s) → {amr_out}")
+        else:
+            print("[INFO] AMRFinderPlus: no hits (or tool unavailable)")
 
     # Parse header metadata for all records (needed for GC reference and
     # chromosome identification before per-contig analysis)
@@ -2218,7 +2664,7 @@ def main():
         print(f"  → Analysing {rec.id} ({len(rec.seq):,} bp) ...", end=" ", flush=True)
         res = analyse_contig(rec, args, annot_df, gfa_topology, ref_gc,
                              chromosome_depth=chromosome_depth,
-                             bam_handle=_bam_handle)
+                             bam_handle=_bam_handle, amr_df=amr_df)
         score = res["evidence"]["score"]["total_score"]
         conf  = res["evidence"]["score"]["confidence"]
         circ  = all_headers[rec.id]["circular"]
@@ -2233,6 +2679,248 @@ def main():
     # Filter and sort
     results = sorted(results, key=lambda x: x["evidence"]["score"]["total_score"], reverse=True)
     results = [r for r in results if r["evidence"]["score"]["total_score"] >= args.min_score]
+    return results
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Identify linear plasmids in assembled sequences",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    parser.add_argument("-i", "--input",   default=None,
+                        help="Input FASTA file (assembled sequences). "
+                             "Mutually exclusive with --hybracter-dir.")
+    parser.add_argument("--hybracter-dir", dest="hybracter_dir", default=None,
+                        help="Hybracter output directory root. Auto-discovers every "
+                             "sample's FINAL_OUTPUT FASTA, per_contig_stats.tsv "
+                             "(for chromosome/plasmid separation), Flye/Plassembler "
+                             "GFA, and Hybracter's own QC'd long reads (for "
+                             "auto-BAM-mapping), and runs the pipeline once per "
+                             "sample. Mutually exclusive with -i/--input; --bam/"
+                             "--longread-fastq/--shortread-* are not supported "
+                             "alongside it (ambiguous across samples).")
+    parser.add_argument("-o", "--output",  default="linear_plasmid_report",
+                        help="Output prefix (default: linear_plasmid_report)")
+    parser.add_argument("--bam",           help="Pre-mapped BAM file of reads aligned to assembly")
+    parser.add_argument("--longread-fastq", dest="longread_fastq",
+                        help="Long-read FASTQ (or .fastq.gz) — mapped automatically "
+                             "with minimap2 to produce a BAM for IDR and coverage analysis")
+    parser.add_argument("--longread-preset", dest="longread_preset",
+                        default="map-ont",
+                        choices=["map-ont", "map-pb", "map-hifi"],
+                        help="minimap2 preset for long reads "
+                             "(map-ont Nanopore, map-pb PacBio CLR, map-hifi PacBio HiFi; "
+                             "default: map-ont)")
+    parser.add_argument("--longread-threads", dest="longread_threads",
+                        type=int, default=4,
+                        help="Threads for minimap2 / samtools (default: 4)")
+    parser.add_argument("--shortread-fastq", dest="shortread_fastq",
+                        metavar="INTERLEAVED.fastq.gz",
+                        help="Interleaved paired-end Illumina FASTQ — mapped with "
+                             "minimap2 sr preset; produces <output-prefix>.short.sorted.bam")
+    parser.add_argument("--shortread-r1", dest="shortread_r1",
+                        metavar="R1.fastq.gz",
+                        help="Illumina R1 FASTQ (paired-end, separate files)")
+    parser.add_argument("--shortread-r2", dest="shortread_r2",
+                        metavar="R2.fastq.gz",
+                        help="Illumina R2 FASTQ (paired-end, separate files)")
+    parser.add_argument("--shortread-threads", dest="shortread_threads",
+                        type=int, default=4,
+                        help="Threads for minimap2 / samtools short-read mapping "
+                             "(default: 4)")
+    parser.add_argument("--gfa",           help="Assembly graph GFA file (Unicycler/Flye/Plassembler)")
+    parser.add_argument("--hairpin-k", dest="hairpin_k", type=int, default=31,
+                        help="k-mer size for terminal hairpin detection (default: 31)")
+    parser.add_argument("--hairpin-window", dest="hairpin_window", type=int, default=50_000,
+                        help="Terminal window (bp) scanned at each contig end for "
+                             "hairpin fold-backs (default: 50000)")
+    parser.add_argument("--hairpin-min-shared", dest="hairpin_min_shared", type=int, default=25,
+                        help="Min supporting reverse-complement k-mer pairs to call "
+                             "a terminal hairpin (default: 25)")
+    parser.add_argument("--hairpin-edge-tol", dest="hairpin_edge_tol", type=int, default=100,
+                        help="Max gap (bp) from the terminus to still call a fold-back "
+                             "TERMINAL (default: 100)")
+    parser.add_argument("--annotate-gfa-hairpins", action="store_true",
+                        dest="annotate_gfa_hairpins",
+                        help="Write <gfa-stem>.hairpins.gfa alongside --gfa with "
+                             "Autocycler-style hairpin links (L n + n -) added for "
+                             "any segment with a terminal fold-back. Diagnostic "
+                             "Bandage-visualization aid; does not affect scoring.")
+    parser.add_argument("--annot",         help="GFF3/TSV annotation file (Prokka)")
+    parser.add_argument("--amrfinder", action="store_true",
+                        help="Screen for antimicrobial resistance genes with NCBI "
+                             "AMRFinderPlus (run once on the whole assembly in "
+                             "nucleotide mode; requires 'amrfinder' on PATH and its "
+                             "database installed). Reported per contig in the TSV/"
+                             "JSON output — informational only, not scored.")
+    parser.add_argument("--amrfinder-db", dest="amrfinder_db", default=None,
+                        help="Custom AMRFinderPlus database directory (passed as -d). "
+                             "Default: whatever database amrfinder finds on its own.")
+    parser.add_argument("--amrfinder-organism", dest="amrfinder_organism", default=None,
+                        help="Organism for AMRFinderPlus point-mutation screening "
+                             "(passed as -O), e.g. Enterococcus_faecium. "
+                             "See `amrfinder -l` for the supported organism list.")
+    parser.add_argument("--amrfinder-threads", dest="amrfinder_threads",
+                        type=int, default=4,
+                        help="Threads for amrfinder (default: 4)")
+    parser.add_argument("--blast-db",      help="BLAST database path (e.g. PLSDB)")
+    parser.add_argument("--blast-identity", type=float, default=70.0,
+                        help="Minimum BLAST %%identity (default: 70)")
+    parser.add_argument("--skani-db",
+                        help="SKANI database: pre-sketched directory or FASTA file. "
+                             "For large FASTA DBs, pre-sketch with: "
+                             "skani sketch -l db.fna -o db_dir/")
+    parser.add_argument("--skani-ani", type=float, default=90.0,
+                        help="Minimum SKANI ANI %%%% (default: 90)")
+    parser.add_argument("--skani-af",  type=float, default=0.05,
+                        help="Minimum SKANI query alignment fraction (default: 0.05)")
+    parser.add_argument("--chromosome-contigs", nargs="*", default=[],
+                        help="Contig IDs of chromosome (for copy number normalisation)")
+    parser.add_argument("--ref-gc", type=float, default=None,
+                        help="Reference GC%% of chromosome (for GC deviation scoring)")
+    parser.add_argument("--min-length", type=int, default=5_000,
+                        help="Minimum contig length to analyse (default: 5000 bp)")
+    parser.add_argument("--min-score", type=int, default=CONFIDENCE_THRESHOLDS["LOW"],
+                        help=f"Minimum score to report (default: {CONFIDENCE_THRESHOLDS['LOW']}, "
+                             f"the LOW confidence threshold)")
+    parser.add_argument("--no-plasmid-finder-hit", action="store_true",
+                        dest="plasmid_finder_no_hit",
+                        help="Flag: PlasmidFinder found no replicon hit "
+                             "(positive linear plasmid indicator, Hashimoto 2019)")
+    parser.add_argument("--json", action="store_true",
+                        help="Also write detailed JSON output")
+    parser.add_argument("--visualize", action="store_true",
+                        help="Generate Figure-3-style left-end visualization (PNG) for "
+                             "contigs with IDR/TATA evidence (requires matplotlib)")
+    args = parser.parse_args()
+
+    # ── Validate -i / --hybracter-dir mutual exclusivity ──────────────────────
+    if bool(args.input) == bool(args.hybracter_dir):
+        parser.error("Exactly one of -i/--input or --hybracter-dir is required.")
+
+    # ── Validate short-read arguments ─────────────────────────────────────────
+    _sr_interleaved = getattr(args, "shortread_fastq", None)
+    _sr_r1          = getattr(args, "shortread_r1", None)
+    _sr_r2          = getattr(args, "shortread_r2", None)
+
+    if _sr_interleaved and (_sr_r1 or _sr_r2):
+        parser.error("--shortread-fastq (interleaved) and --shortread-r1/r2 "
+                     "are mutually exclusive.")
+    if bool(_sr_r1) != bool(_sr_r2):
+        parser.error("--shortread-r1 and --shortread-r2 must be supplied together.")
+
+    batch_mode = bool(args.hybracter_dir)
+    seq_maps = {}    # sample (or None in single mode) -> {contig_id: seq}, for --visualize
+    sample_bams = {}  # sample (or None in single mode) -> bam path used, for --visualize
+
+    if batch_mode:
+        if args.bam or args.longread_fastq or _sr_interleaved or _sr_r1:
+            parser.error("--bam/--longread-fastq/--shortread-* are not supported "
+                         "alongside --hybracter-dir (ambiguous across multiple "
+                         "samples) — Hybracter's own QC'd long reads are "
+                         "auto-mapped per sample instead.")
+
+        samples = discover_hybracter_samples(args.hybracter_dir)
+        if not samples:
+            print(f"[ERROR] No Hybracter samples found under {args.hybracter_dir} "
+                  f"(expected FINAL_OUTPUT/{{complete,incomplete}}/*_final.fasta)",
+                  file=sys.stderr)
+            sys.exit(1)
+        print(f"[INFO] Discovered {len(samples)} Hybracter sample(s) under "
+              f"{args.hybracter_dir}\n")
+
+        results = []
+        for s in samples:
+            print(f"{'='*60}\n[SAMPLE] {s['sample']}  "
+                  f"({'complete' if s['complete'] else 'incomplete'})\n{'='*60}")
+
+            sample_args = copy.deepcopy(args)
+            sample_args.input = s["fasta"]
+            if not sample_args.gfa:
+                sample_args.gfa = s["flye_gfa"] or s["plassembler_gfa"]
+
+            if s["contig_stats_tsv"]:
+                stats = parse_hybracter_contig_stats(s["contig_stats_tsv"])
+                if stats and not sample_args.chromosome_contigs:
+                    sample_args.chromosome_contigs = [
+                        c for c, v in stats.items() if v["contig_type"] == "chromosome"]
+                    if sample_args.chromosome_contigs:
+                        print(f"[INFO] Chromosome contig(s) from per_contig_stats.tsv: "
+                              f"{', '.join(sample_args.chromosome_contigs)}")
+
+            if s["longread_fastq"]:
+                bam_out = f"{args.output}_{s['sample']}.sorted.bam"
+                mapped = map_longreads(
+                    fastq          = s["longread_fastq"],
+                    assembly_fasta = s["fasta"],
+                    output_bam     = bam_out,
+                    preset         = args.longread_preset,
+                    threads        = args.longread_threads,
+                )
+                if mapped:
+                    sample_args.bam = mapped
+                else:
+                    print(f"[WARN] Long-read mapping failed for {s['sample']}; "
+                          f"continuing without BAM.", file=sys.stderr)
+
+            sample_results = run_single_assembly(sample_args)
+            for r in sample_results:
+                r["sample"] = s["sample"]
+            results.extend(sample_results)
+            seq_maps[s["sample"]] = {rec.id: str(rec.seq)
+                                     for rec in SeqIO.parse(s["fasta"], "fasta")}
+            sample_bams[s["sample"]] = sample_args.bam or ""
+            print()
+
+        # Re-sort the combined multi-sample results by score
+        results = sorted(results, key=lambda x: x["evidence"]["score"]["total_score"], reverse=True)
+
+    else:
+        # ── Auto-map long reads if --longread-fastq supplied ─────────────────
+        if args.longread_fastq:
+            if args.bam:
+                print("[WARN] Both --bam and --longread-fastq supplied; "
+                      "--bam takes precedence, skipping mapping.", file=sys.stderr)
+            else:
+                bam_out = f"{args.output}.sorted.bam"
+                mapped = map_longreads(
+                    fastq          = args.longread_fastq,
+                    assembly_fasta = args.input,
+                    output_bam     = bam_out,
+                    preset         = args.longread_preset,
+                    threads        = args.longread_threads,
+                )
+                if mapped:
+                    args.bam = mapped
+                else:
+                    print("[WARN] Long-read mapping failed; continuing without BAM.",
+                          file=sys.stderr)
+
+        # ── Auto-map short reads if --shortread-fastq / --shortread-r1/r2 given
+        if _sr_interleaved or _sr_r1:
+            if args.bam:
+                print("[WARN] --bam already set; skipping short-read mapping "
+                      "(--bam takes precedence).", file=sys.stderr)
+            else:
+                bam_out = f"{args.output}.short.sorted.bam"
+                mapped = map_shortreads(
+                    assembly_fasta = args.input,
+                    output_bam     = bam_out,
+                    interleaved    = _sr_interleaved,
+                    r1             = _sr_r1,
+                    r2             = _sr_r2,
+                    threads        = args.shortread_threads,
+                )
+                if mapped:
+                    args.bam = mapped
+                else:
+                    print("[WARN] Short-read mapping failed; continuing without BAM.",
+                          file=sys.stderr)
+
+        results = run_single_assembly(args)
+        seq_maps[None] = {rec.id: str(rec.seq) for rec in SeqIO.parse(args.input, "fasta")}
+        sample_bams[None] = args.bam or ""
 
     # Build TSV output
     rows = []
@@ -2241,7 +2929,10 @@ def main():
         sc = ev["score"]
         genes = ev.get("genes", {})
         hdr = ev.get("header", {})
-        rows.append({
+        row = {}
+        if batch_mode:
+            row["sample"] = r.get("sample", "")
+        row.update({
             "contig":            r["contig"],
             "length_bp":         r["length"],
             "gc_pct":            r["gc"],
@@ -2253,7 +2944,8 @@ def main():
             "circular_flag":     hdr.get("circular_flag", ""),
             "header_copy_number": hdr.get("copy_number", ""),
             "header_depth":      hdr.get("depth", ""),
-            "hairpin_identity":  ev.get("self_complement", {}).get("identity", ""),
+            "hairpin_left_support":  (ev.get("hairpin_ends", {}).get("left") or {}).get("support", ""),
+            "hairpin_right_support": (ev.get("hairpin_ends", {}).get("right") or {}).get("support", ""),
             "idr_confirmed":     ev.get("idr_tata", {}).get("confirmed_idr_tata", ""),
             "idr_left_arm_bp":   ev.get("idr_tata", {}).get("left", {}).get("arm_len", ""),
             "idr_left_loop":     ev.get("idr_tata", {}).get("left", {}).get("loop_seq", ""),
@@ -2268,6 +2960,9 @@ def main():
             "resistance_genes":  "|".join(genes.get("resistance_genes", [])),
             "is_elements":       "|".join(genes.get("is_elements", [])),
             "enterococcal_m":    "|".join(genes.get("enterococcal_markers", [])),
+            "amr_hit_count":     ev.get("amr", {}).get("hits", ""),
+            "amr_genes":         "|".join(ev.get("amr", {}).get("genes", [])),
+            "amr_classes":       "|".join(ev.get("amr", {}).get("classes", [])),
             "blast_hit":         ev.get("blast", {}).get("linear_plasmid_db_hit", False)
                                  or ev.get("blast", {}).get("linear_plasmid_hit", False),
             "blast_top_hit":     ev.get("blast", {}).get("top_hit", ""),
@@ -2283,6 +2978,7 @@ def main():
             "copy_number":       ev.get("copy_number", {}).get("estimated_copy_number", ""),
             "score_breakdown":   str(sc["breakdown"]),
         })
+        rows.append(row)
 
     tsv_path = f"{args.output}.tsv"
     df_out = pd.DataFrame(rows)
@@ -2296,9 +2992,10 @@ def main():
         if len(subset) > 0:
             print(f"\n  {conf} confidence ({len(subset)} contigs):")
             for _, row in subset.iterrows():
-                print(f"    {row['contig']:30s}  {row['length_bp']:>10,} bp  "
+                sample_tag = f"{row['sample']}: " if batch_mode else ""
+                print(f"    {sample_tag}{row['contig']:30s}  {row['length_bp']:>10,} bp  "
                       f"score={row['score']:>3}  GC={row['gc_pct']}%  "
-                      f"hairpin_id={row['hairpin_identity']}  "
+                      f"hairpin(L/R)={row['hairpin_left_support']}/{row['hairpin_right_support']}  "
                       f"asymmetric={row['asymmetric_ends']}")
 
     # JSON output
@@ -2315,15 +3012,16 @@ def main():
         if viz_contigs:
             print(f"\n[VIZ] Generating terminal-structure plots for "
                   f"{len(viz_contigs)} contig(s)…")
-            seq_map = {rec.id: str(rec.seq)
-                       for rec in SeqIO.parse(args.input, "fasta")}
             for r in viz_contigs:
+                sample_key = r.get("sample")  # None in single mode
+                seq_map = seq_maps.get(sample_key, {})
+                out_prefix = f"{args.output}_{sample_key}" if sample_key else args.output
                 visualize_terminal_structure(
                     contig_id     = r["contig"],
                     seq           = seq_map.get(r["contig"], ""),
                     evidence      = r["evidence"],
-                    bam_file      = args.bam or "",
-                    output_prefix = args.output,
+                    bam_file      = sample_bams.get(sample_key, ""),
+                    output_prefix = out_prefix,
                 )
         else:
             print("[VIZ] No contigs with IDR/TATA evidence or HIGH/MEDIUM confidence "

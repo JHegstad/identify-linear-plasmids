@@ -38,6 +38,7 @@ Installed automatically via `environment.yml`:
 | `minimap2`, `samtools` | Auto-mapping via `--longread-fastq` / `--shortread-*` |
 | `blast` | `--blast-db` homology search against a plasmid database (e.g. PLSDB) |
 | `skani` | `--skani-db` ANI-based plasmid database search |
+| `ncbi-amrfinderplus` | `--amrfinder` antimicrobial resistance gene screening (run `amrfinder -u` once after install to fetch its database) |
 
 Only `biopython`/`numpy`/`pandas` are strictly required — the script degrades
 gracefully when the other optional inputs/tools aren't supplied, using
@@ -81,6 +82,7 @@ python identify_linear_plasmids.py -i assembly.fasta \
     --bam reads.bam --gfa assembly.gfa \
     --annot prokka.gff --blast-db plsdb.fasta \
     --skani-db skani_db/sketches \
+    --amrfinder --amrfinder-organism Enterococcus_faecium \
     --ref-gc 37.5 --chromosome-contigs chr1 \
     --json
 ```
@@ -119,6 +121,8 @@ commonly used:
 | `--shortread-fastq` / `--shortread-r1`/`--shortread-r2` | Illumina reads to auto-map |
 | `--gfa` | Assembly graph (Unicycler/Flye/Plassembler) for topology evidence |
 | `--annot` | GFF3/Prokka TSV annotation for gene-based evidence |
+| `--amrfinder` | Screen for AMR genes with NCBI AMRFinderPlus (reported per contig, not scored) |
+| `--amrfinder-organism` | Organism for AMRFinderPlus point-mutation screening (e.g. `Enterococcus_faecium`) |
 | `--blast-db` | Plasmid database (e.g. PLSDB) for BLAST homology search |
 | `--skani-db` | Pre-sketched or FASTA plasmid database for SKANI ANI search |
 | `--chromosome-contigs` | Chromosome contig ID(s), for copy-number normalisation |
@@ -158,3 +162,6 @@ the exact per-category weights and rationale.
 - `<prefix>_<contig>_terminal.png` — with `--visualize`; terminal-structure
   plot (coverage, soft/hard clips, IDR arms) for flagged contigs.
 - `<gfa-stem>.hairpins.gfa` — with `--annotate-gfa-hairpins`.
+- `<prefix>.amrfinder.tsv` — with `--amrfinder`; raw AMRFinderPlus output for
+  the whole assembly (per-contig summary columns `amr_hit_count`/`amr_genes`/
+  `amr_classes` are folded into the main TSV/JSON).
