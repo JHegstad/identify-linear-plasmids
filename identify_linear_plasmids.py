@@ -3035,8 +3035,10 @@ def main():
     print(f"\n[OUTPUT] TSV report → {tsv_path}")
     print(f"[OUTPUT] {len(rows)} contigs reported (score ≥ {args.min_score})")
 
-    # Summary to stdout
-    for conf in ["HIGH", "MEDIUM", "LOW"]:
+    # Summary to stdout. df_out can be empty with no columns at all (e.g. every
+    # contig gated to 0 by compute_score's hard gates and filtered by
+    # --min-score) — pd.DataFrame([]) has no "confidence" column to index.
+    for conf in ["HIGH", "MEDIUM", "LOW"] if not df_out.empty else []:
         subset = df_out[df_out["confidence"] == conf]
         if len(subset) > 0:
             print(f"\n  {conf} confidence ({len(subset)} contigs):")
