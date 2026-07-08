@@ -1,0 +1,77 @@
+#!/usr/bin/env python3
+"""
+Combine per-sample identify_linear_plasmids.py outputs (written to
+SAMPLE_DIR/linear_plasmid/SAMPLE.tsv[.json]) into one batch-wide TSV/JSON.
+
+Each per-sample run is invoked in --hybracter-dir mode but discovers only
+one sample, so its TSV has no 'sample' column (that column is only added by
+the script's own multi-sample batch loop). This script adds it back and
+concatenates everything.
+
+Usage:
+    combine_batch_results.py SRC_DIR [-o OUT_PREFIX]
+"""
+import argparse
+import json
+import sys
+from pathlib import Path
+
+import pandas as pd
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("src_dir", help="Root dir containing SAMPLE/linear_plasmid/SAMPLE.tsv")
+    ap.add_argument("-o", "--output", default="linear_plasmid_batch_summary",
+                     help="Output prefix (default: linear_plasmid_batch_summary)")
+    args = ap.parse_args()
+
+    src = Path(args.src_dir)
+    # Only the main report <sample>/linear_plasmid/<sample>.tsv — not
+    # byproduct files written to the same dir, e.g. <sample>.amrfinder.tsv.
+    tsvs = sorted(
+        p / "linear_plasmid" / f"{p.name}.tsv"
+        for p in src.glob("*")
+        if (p / "linear_plasmid" / f"{p.name}.tsv").exists()
+    )
+    if not tsvs:
+        print(f"[ERROR] No per-sample TSVs found under {src}/*/linear_plasmid/", file=sys.stderr)
+        sys.exit(1)
+
+    frames = []
+    combined_json = []
+    for tsv_path in tsvs:
+        sample = tsv_path.stem
+        df = pd.read_csv(tsv_path, sep="\t")
+        if "sample" not in df.columns:
+            df.insert(0, "sample", sample)
+        frames.append(df)
+
+        json_path = tsv_path.with_suffix(".json")
+        if json_path.exists():
+            with open(json_path) as fh:
+                records = json.load(fh)
+            for r in records:
+                r.setdefault("sample", sample)
+            combined_json.extend(records)
+
+    combined = pd.concat(frames, ignore_index=True)
+    combined = combined.sort_values("score", ascending=False)
+
+    out_tsv = f"{args.output}.tsv"
+    combined.to_csv(out_tsv, sep="\t", index=False)
+    print(f"[OUTPUT] Combined TSV  → {out_tsv}  ({len(combined)} contigs, {len(tsvs)} samples)")
+
+    if combined_json:
+        out_json = f"{args.output}.json"
+        with open(out_json, "w") as fh:
+            json.dump(combined_json, fh, indent=2)
+        print(f"[OUTPUT] Combined JSON → {out_json}")
+
+    print("\nConfidence summary:")
+    print(combined.groupby(["sample", "confidence"]).size().unstack(fill_value=0)
+          .reindex(columns=["HIGH", "MEDIUM", "LOW"], fill_value=0))
+
+
+if __name__ == "__main__":
+    main()

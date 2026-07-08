@@ -1714,13 +1714,18 @@ def compute_score(evidence: dict) -> dict:
         breakdown["gc_deviation"] = SCORING_WEIGHTS["gc_deviation"]
 
     # 5. Gene-based scoring.
-    # Suppressed only when annotation could not be matched to this contig
-    # (Prokka-TSV fallback: all genes smeared across all contigs). A circular
-    # flag alone does not make gene evidence unreliable when the annotation is
-    # a properly-matched GFF3 with per-contig features.
+    # Suppressed when annotation could not be matched to this contig
+    # (Prokka-TSV fallback: all genes smeared across all contigs), OR when the
+    # header already confirms circular=true (CIRCULAR_DISQUALIFIES_GENE_SCORING):
+    # partition systems, TA systems, and IS elements are common chromosomal
+    # background too, so on a contig the assembler itself calls circular they
+    # aren't discriminating evidence for a *linear* plasmid. Structural/
+    # sequence evidence (hairpin, GFA topology, blast/skani, coverage drop)
+    # still runs independently and is what should override a mistaken
+    # assembler circular= call (see Hashimoto 2019 hairpin-fools-assembler).
     genes = evidence.get("genes", {})
-    if genes.get("_annotation_mismatch"):
-        genes = {}   # suppress gene scoring — annotation not contig-specific
+    if genes.get("_annotation_mismatch") or (CIRCULAR_DISQUALIFIES_GENE_SCORING and is_confirmed_circular):
+        genes = {}   # suppress gene scoring
 
     if genes.get("partition_genes"):
         score += SCORING_WEIGHTS["par_system"]
@@ -1795,6 +1800,40 @@ def compute_score(evidence: dict) -> dict:
         score += SCORING_WEIGHTS["copy_number_low"]
         breakdown["copy_number_low"] = SCORING_WEIGHTS["copy_number_low"]
 
+    # ── Hard gates ──────────────────────────────────────────────────────────
+    # Applied last, after every category above has had a chance to score, so
+    # no future evidence category can silently bypass them.
+    gate_reason = None
+
+    # 1. Chromosomes can never be linear plasmids, regardless of evidence.
+    if evidence.get("is_chromosome"):
+        gate_reason = ("chromosome (multi-Mb circular=true and/or 'chromosome' "
+                       "in contig id) — excluded from linear-plasmid scoring")
+        score = 0
+        breakdown = {}
+
+    # 2. A plasmid-sized contig the assembler already calls circular=true can
+    # only be scored as a linear-plasmid candidate if it carries genuine,
+    # independently-detected telomere structure (hairpin fold-back or a
+    # pELF1-type asymmetric hairpin+invertron end) — the actual structural
+    # signature Hashimoto 2019 describes an assembler being fooled by.
+    # Indirect evidence (skani/blast hit, GFA topology, coverage-drop, gene
+    # content, size/GC/copy-number) is not on its own strong enough to
+    # override a circular call: those signals are also seen on ordinary
+    # circular replicons, so allowing them through here would make every
+    # circular=true plasmid a potential false positive.
+    elif is_confirmed_circular:
+        has_telomere_evidence = bool(
+            idr.get("confirmed_idr_tata")
+            or hairpin_ends.get("left") or hairpin_ends.get("right")
+            or asym.get("asymmetric_pelf_type") or asym.get("has_tp_gene"))
+        if not has_telomere_evidence:
+            gate_reason = ("circular=true in header with no independently-detected "
+                           "hairpin/telomere evidence — indirect evidence alone "
+                           "cannot override an assembler circular call")
+            score = 0
+            breakdown = {}
+
     # Confidence level
     if score >= CONFIDENCE_THRESHOLDS["HIGH"]:
         confidence = "HIGH"
@@ -1818,6 +1857,7 @@ def compute_score(evidence: dict) -> dict:
         "percent": round(100 * score / max_score, 1),
         "confidence": confidence,
         "breakdown": breakdown,
+        "gate_reason": gate_reason,
     }
 
 
@@ -2447,6 +2487,14 @@ def analyse_contig(record, args, annot_df, gfa_topology, ref_gc=None,
     evidence["header"] = assess_header_metadata(
         header_meta, chromosome_depth, seq_len=len(seq))
 
+    # Chromosome identification — same heuristic used for copy-number
+    # normalisation elsewhere (run_single_assembly): explicit circular=true
+    # on a multi-Mb contig, or "chromosome" in the contig id. Used by
+    # compute_score to hard-exclude chromosomes from linear-plasmid scoring.
+    evidence["is_chromosome"] = (
+        (evidence["header"].get("circular_flag") is True and len(seq) > 500_000)
+        or "chromosome" in cid.lower())
+
     # Structural (hairpin, invertron end)
     evidence["hairpin_ends"] = detect_terminal_hairpins(
         seq,
@@ -2940,6 +2988,7 @@ def main():
             "max_score":         sc["max_possible"],
             "pct_max":           sc["percent"],
             "confidence":        sc["confidence"],
+            "gate_reason":       sc.get("gate_reason") or "",
             # Header metadata columns
             "circular_flag":     hdr.get("circular_flag", ""),
             "header_copy_number": hdr.get("copy_number", ""),
