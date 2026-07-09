@@ -1884,8 +1884,9 @@ def compute_score(evidence: dict) -> dict:
 
     # 1. Chromosomes can never be linear plasmids, regardless of evidence.
     if evidence.get("is_chromosome"):
-        gate_reason = ("chromosome (multi-Mb circular=true and/or 'chromosome' "
-                       "in contig id) — excluded from linear-plasmid scoring")
+        gate_reason = ("chromosome (>500 kb and/or 'chromosome' in contig id) "
+                       "— excluded from linear-plasmid scoring regardless of "
+                       "its circular= flag")
         score = 0
         breakdown = {}
 
@@ -2564,13 +2565,21 @@ def analyse_contig(record, args, annot_df, gfa_topology, ref_gc=None,
     evidence["header"] = assess_header_metadata(
         header_meta, chromosome_depth, seq_len=len(seq))
 
-    # Chromosome identification — same heuristic used for copy-number
-    # normalisation elsewhere (run_single_assembly): explicit circular=true
-    # on a multi-Mb contig, or "chromosome" in the contig id. Used by
-    # compute_score to hard-exclude chromosomes from linear-plasmid scoring.
-    evidence["is_chromosome"] = (
-        (evidence["header"].get("circular_flag") is True and len(seq) > 500_000)
-        or "chromosome" in cid.lower())
+    # Chromosome identification for the hard-exclude gate below. Any contig
+    # above the plausible-linear-plasmid ceiling (SIZE_RANGES["general"],
+    # 500 kb — the same bound _gfa_dominant_segment_is_open() already uses)
+    # is excluded regardless of its circular= flag. Originally this also
+    # required circular_flag is True, mirroring the chromosome-detection
+    # heuristic used elsewhere for copy-number normalisation (which
+    # legitimately wants a confidently-closed reference replicon) — but that
+    # made the gate *weaker* exactly when it mattered most: a poorly-
+    # resolved assembly that fails to close the chromosome into a circle
+    # emits circular=false on a multi-Mb contig, which used to sail straight
+    # through ungated *and* collect assembler_not_circular's 13 points for
+    # "not circular" on top. Confirmed in practice on a reduced-assembler
+    # (Flye+Plassembler-only) consensus run: two full chromosomes scored
+    # 42 HIGH and 31 MEDIUM as linear-plasmid candidates before this fix.
+    evidence["is_chromosome"] = len(seq) > 500_000 or "chromosome" in cid.lower()
 
     # Structural (hairpin, invertron end)
     evidence["hairpin_ends"] = detect_terminal_hairpins(

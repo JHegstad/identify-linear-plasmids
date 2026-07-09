@@ -210,9 +210,13 @@ the exact per-category weights and rationale.
 can override everything else back down to 0:
 
 - **Chromosomes never score as linear plasmids**, regardless of evidence — a
-  contig is treated as the chromosome if the assembler header says
-  `circular=true` on a >500 kb sequence, or `"chromosome"` appears in the
-  contig id.
+  contig is treated as the chromosome if it's over 500 kb (the same ceiling
+  `classify_size()` already treats as implausible for a linear plasmid), or
+  `"chromosome"` appears in the contig id. This applies regardless of the
+  assembler's own `circular=` call: a poorly-resolved assembly that fails to
+  close the chromosome into a circle emits `circular=false` on a multi-Mb
+  contig, and that shouldn't earn it linear-plasmid credit — if anything
+  it's assembly incompleteness, not evidence of a genuine open replicon.
 - **A plasmid-sized contig the assembler already calls `circular=true` only
   scores if it carries independently-detected hairpin/telomere structure**
   (a localized terminal fold-back, or a pELF1-type asymmetric hairpin +
