@@ -106,6 +106,60 @@ samples — reads are auto-discovered per sample instead). Output is one
 combined `<prefix>.tsv`/`.json` covering every sample, with a leading
 `sample` column.
 
+### Batch wrapper scripts
+
+`--hybracter-dir` handles a single Hybracter *batch* run (one shared
+`FINAL_OUTPUT/{complete,incomplete}/` across samples). Two other common
+layouts aren't a single Hybracter batch, so they're driven by standalone
+wrapper scripts instead — each just loops the core script (and, where
+needed, Bakta) once per sample directory and merges the results:
+
+| Script | For | Per-sample input |
+|---|---|---|
+| `run_hybracter_bakta_batch.sh` | A collection of **independent single-sample** Hybracter runs, each with its own Bakta annotation already run against that sample's Hybracter contig IDs | `SAMPLE/hybracter/`, `SAMPLE/bakta/SAMPLE.gff3` |
+| `run_bakta_autocycler_batch.sh` | Annotating [Autocycler](https://github.com/rrwick/Autocycler) consensus assemblies with Bakta, run *directly* against Autocycler's own numeric contig IDs | `SAMPLE_autocycler/autocycler_out/consensus_assembly.fasta` → `SAMPLE_autocycler/bakta/SAMPLE.gff3` |
+| `run_autocycler_batch.sh` | The Autocycler assemblies themselves — plain `-i` mode per sample (not `--hybracter-dir`, since there's no Hybracter output at all here) | `SAMPLE_autocycler/autocycler_out/consensus_assembly.{fasta,gfa}`, `SAMPLE_autocycler/SAMPLE.fastq.gz`, and `SAMPLE_autocycler/bakta/SAMPLE.gff3` if present |
+
+```bash
+./run_hybracter_bakta_batch.sh [SRC_DIR] [THREADS]
+./run_bakta_autocycler_batch.sh [SRC_DIR] [BAKTA_DB]
+./run_autocycler_batch.sh [SRC_DIR] [THREADS]
+```
+
+All three take the sample-collection root as their first argument (each
+has a project-specific default baked in — edit it, or just pass a path).
+Every sample is run with the fullest evidence set the wrapper can find
+(GFA topology, long-read auto-mapping, AMRFinderPlus, PLSDB BLAST, skani,
+`--annotate-gfa-hairpins`, `--visualize`, `--json`), and each wrapper ends
+by calling `combine_batch_results.py` to merge every sample's report into
+one `<SRC_DIR>/linear_plasmid_batch_summary.{tsv,json}`.
+
+**Why annotation is a separate step for Autocycler, and why the contig IDs
+matter:** `screen_genes()` matches a GFF3's seqid against each contig by
+*substring*, so an annotation only gives correct gene-based evidence when
+its seqids are exactly the assembly's own contig IDs — a Bakta run against
+a *different* assembly of the same isolate (e.g. Hybracter's
+`chromosome00001`/`plasmid00001` naming) will silently produce wrong
+matches against Autocycler's numeric IDs (`1`, `2`, `3`, ...) rather than
+a clean skip, since e.g. contig `"1"` is a substring of `"chromosome00001"`.
+`run_bakta_autocycler_batch.sh` avoids this by running Bakta straight
+against each Autocycler `consensus_assembly.fasta` with
+`--keep-contig-headers`, so its output seqids are Autocycler's own IDs and
+match cleanly. Run it before `run_autocycler_batch.sh` — the latter picks
+up `SAMPLE_autocycler/bakta/SAMPLE.gff3` automatically via `--annot` when
+present, and otherwise runs without it. (It also passes `--skip-plot` to
+Bakta: the circular-plot step divides by a contig-length-derived
+`step_size` and crashes on the short junk contigs a multi-assembler
+consensus sometimes leaves in — the GFF3 is already fully written by the
+time that step runs, so this only skips an unused cosmetic image.)
+
+`combine_batch_results.py SRC_DIR [-o OUT_PREFIX]` can also be run
+standalone to (re-)merge `SRC_DIR/*/linear_plasmid/*.tsv` reports from any
+of the wrappers above into one combined summary — it discovers exactly one
+non-`.amrfinder.tsv` report per `linear_plasmid/` directory and adds a
+leading `sample` column (taken from the report's own filename) if one
+isn't already present.
+
 ## Key options
 
 Run `python identify_linear_plasmids.py --help` for the full list. The most
@@ -152,10 +206,33 @@ The maximum achievable score is 100. See the `SCORING_WEIGHTS` and
 `CONFIDENCE_THRESHOLDS` dicts at the top of `identify_linear_plasmids.py` for
 the exact per-category weights and rationale.
 
+**Hard gates** are applied last, after every category above has scored, and
+can override everything else back down to 0:
+
+- **Chromosomes never score as linear plasmids**, regardless of evidence — a
+  contig is treated as the chromosome if the assembler header says
+  `circular=true` on a >500 kb sequence, or `"chromosome"` appears in the
+  contig id.
+- **A plasmid-sized contig the assembler already calls `circular=true` only
+  scores if it carries independently-detected hairpin/telomere structure**
+  (a localized terminal fold-back, or a pELF1-type asymmetric hairpin +
+  invertron end). Indirect evidence alone — a skani/BLAST hit, GFA
+  topology, coverage drop, gene content, size/GC/copy-number — isn't
+  sufficient on its own to override an assembler's circular call, since
+  those signals are also seen on ordinary circular replicons.
+
+When a gate fires, the contig's score and breakdown are zeroed and the
+reason is recorded in the `gate_reason` column (TSV) / field (JSON) — check
+it before assuming a 0/NONE result means "no evidence found" rather than
+"gated."
+
 ## Output
 
 - `<prefix>.tsv` — always written; one row per reported contig with score,
-  confidence, and a column per evidence category.
+  confidence, `gate_reason` (non-empty only when a hard gate zeroed the
+  contig), and a column per evidence category. With every contig gated or
+  below `--min-score`, this is a valid header-less near-empty file rather
+  than an error.
 - `<prefix>.json` — with `--json`; full per-contig evidence detail.
 - `<prefix>.sorted.bam` (+ `.bai`) — written when `--longread-fastq` or
   `--shortread-*` triggers auto-mapping.
@@ -165,3 +242,8 @@ the exact per-category weights and rationale.
 - `<prefix>.amrfinder.tsv` — with `--amrfinder`; raw AMRFinderPlus output for
   the whole assembly (per-contig summary columns `amr_hit_count`/`amr_genes`/
   `amr_classes` are folded into the main TSV/JSON).
+
+Each batch wrapper script (see above) additionally writes
+`<SRC_DIR>/linear_plasmid_batch_summary.{tsv,json}` — every sample's report
+concatenated with a leading `sample` column — and
+`<SRC_DIR>/_linear_plasmid_batch_logs/<SAMPLE>.log` per-sample run logs.
