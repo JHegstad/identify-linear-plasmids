@@ -7,15 +7,16 @@
 #   SAMPLE_autocycler/autocycler_out/consensus_assembly.fasta
 #   SAMPLE_autocycler/autocycler_out/consensus_assembly.gfa
 #
-# Unlike the Hybracter+Bakta batch, no --annot is used here: Bakta
-# annotations that exist for some of these isolates were run against the
-# *Hybracter* assembly's contig IDs (chromosome00001, plasmid00001, ...),
-# not Autocycler's (1, 2, 3, ...). Since screen_genes() matches contig IDs
-# by substring, feeding that annotation in against Autocycler's numeric IDs
-# risks spurious matches (contig "1" substring-matches "chromosome00001",
-# "plasmid00001", etc.) rather than a clean skip. Every other evidence
-# source (GFA topology, AMRFinderPlus, BLAST/skani, coverage-drop,
-# hairpin/telomere detection) is unaffected by this and still runs.
+# Uses SAMPLE_autocycler/bakta/SAMPLE.gff3 for --annot when present (see
+# run_bakta_autocycler_batch.sh — annotates consensus_assembly.fasta
+# directly with --keep-contig-headers, so its seqids are Autocycler's own
+# numeric contig IDs and match cleanly). Earlier revisions of this batch
+# deliberately ran without --annot: the only Bakta annotations available
+# at the time were run against the *Hybracter* assembly's contig IDs
+# (chromosome00001, plasmid00001, ...), and since screen_genes() matches
+# contig IDs by substring, feeding those in against Autocycler's numeric
+# IDs would have risked spurious matches (contig "1" substring-matches
+# "chromosome00001") rather than a clean skip.
 #
 # Usage:
 #   ./run_autocycler_batch.sh [SRC_DIR] [THREADS]
@@ -63,6 +64,7 @@ for sample_dir in "$SRC_DIR"/*_autocycler/; do
     fasta="${sample_dir}autocycler_out/consensus_assembly.fasta"
     gfa="${sample_dir}autocycler_out/consensus_assembly.gfa"
     fastq="${sample_dir}${sample}.fastq.gz"
+    gff3="${sample_dir}bakta/${sample}.gff3"
 
     if [ ! -f "$fasta" ]; then
         echo "[SKIP] $sample: no consensus_assembly.fasta"
@@ -72,6 +74,13 @@ for sample_dir in "$SRC_DIR"/*_autocycler/; do
 
     gfa_args=()
     [ -f "$gfa" ] && gfa_args=(--gfa "$gfa")
+
+    annot_args=()
+    if [ -f "$gff3" ]; then
+        annot_args=(--annot "$gff3")
+    else
+        echo "[WARN] $sample: no Bakta annotation at $gff3, running without --annot"
+    fi
 
     fastq_args=()
     if [ -f "$fastq" ]; then
@@ -91,6 +100,7 @@ for sample_dir in "$SRC_DIR"/*_autocycler/; do
     python "$IDENTIFY" \
         -i "$fasta" \
         "${gfa_args[@]}" \
+        "${annot_args[@]}" \
         "${fastq_args[@]}" \
         --amrfinder --amrfinder-organism "$AMR_ORGANISM" --amrfinder-threads "$THREADS" \
         --blast-db "$BLAST_DB" \
