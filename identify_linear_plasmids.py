@@ -1347,6 +1347,39 @@ def _gfa_component_is_circular_loop(component, fnext, rnext, fprev, rprev) -> bo
     return len(visited) == len(component)
 
 
+def _gfa_dominant_segment_is_open(comp, segments, min_main_len: int = 5_000,
+                                  max_main_len: int = SIZE_RANGES["general"][1],
+                                  min_dominance_frac: float = 0.7,
+                                  min_dominance_ratio: float = 5.0) -> bool:
+    """
+    True if one segment in a multi-segment component dominates it in length
+    and every other segment is small by comparison — the signature Autocycler
+    leaves for a real hairpin telomere: the main body plus a cluster of tiny
+    "satellite" segments representing assembler ambiguity at the fold-back
+    repeat, linked to one or both of the main segment's ends without closing
+    a loop. Distinguishes that from genuine multi-contig fragmentation (e.g.
+    an unresolved chromosome sitting in several comparably-large pieces),
+    which won't have one segment towering over the rest.
+
+    The same graph signature also shows up around large (multi-hundred-kb to
+    Mb-scale) unresolved chromosome fragments — an isolated big piece with
+    its own small tangle of assembly-ambiguity segments at its ends is not
+    distinguishable from a real telomere by topology alone. max_main_len
+    caps the main segment at SIZE_RANGES["general"]'s upper bound (500 kb,
+    the same "plausible linear plasmid" ceiling classify_size() already
+    uses) so this only fires in a size range a linear plasmid could
+    plausibly occupy.
+    """
+    lens = sorted((segments.get(s, 0) for s in comp), reverse=True)
+    if not lens:
+        return False
+    main_len, total_len = lens[0], sum(lens)
+    second_len = lens[1] if len(lens) > 1 else 0
+    return (min_main_len <= main_len <= max_main_len
+            and main_len >= min_dominance_frac * total_len
+            and (second_len == 0 or main_len >= min_dominance_ratio * second_len))
+
+
 def _gfa_classify_components(segments, links):
     """Classify every connected component of the graph.
     Returns list of dicts: {'segs','length','topology','hairpin'}
@@ -1364,8 +1397,10 @@ def _gfa_classify_components(segments, links):
             topo = "linear"          # isolated unitig, open ends
         elif len(comp) == 1:
             topo = "linear"          # single unitig with a hairpin link
+        elif _gfa_dominant_segment_is_open(comp, segments):
+            topo = "linear"          # dominant body + small satellite fragments
         else:
-            topo = "fragmented"      # several unitigs, not a clean loop
+            topo = "fragmented"      # several comparably-sized unitigs, not a clean loop
         out.append({"segs": comp, "length": length, "topology": topo,
                     "hairpin": hp})
     return out
