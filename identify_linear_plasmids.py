@@ -1406,20 +1406,33 @@ def _gfa_classify_components(segments, links):
     return out
 
 
-def parse_gfa_topology(gfa_file: str, length_map: dict = None) -> dict:
+def _closest_contig_by_length(seg_len, length_map: dict, used: set,
+                              rel_tol: float = 0.002, abs_tol: int = 50):
     """
-    Parse a GFA assembly graph (Flye/Unicycler/Plassembler output) and
-    classify each segment's connected component as circular / linear /
-    fragmented, walking the strand-aware graph rather than just counting
-    link degree (see module comment above).
-
-    Returns a dict: contig_id → {"topology": ..., "hairpin": bool}.
-
-    length_map: optional {contig_id: seq_length} built from FASTA records.
-    When GFA segment names differ from FASTA contig IDs (e.g. Plassembler
-    uses numeric names like "1", "2", ...) segments are re-keyed by matching
-    their LN tag against the provided lengths. Ambiguous lengths are skipped.
+    Find the final contig whose length is closest to seg_len, within a small
+    tolerance. Exact equality is too strict for a raw pre-polish assembly
+    graph (e.g. Flye's) matched against Hybracter's final polished contigs —
+    polishing (medaka/polypolish/pypolca) typically shifts a contig's length
+    by a handful of bases, not a meaningful fraction, so exact-length lookup
+    silently drops almost every segment. Returns None if nothing is within
+    tolerance, if two candidates tie for closest (ambiguous), or if the best
+    candidate is already claimed by an earlier segment in this same file.
     """
+    if not seg_len:
+        return None
+    tol = max(abs_tol, int(seg_len * rel_tol))
+    candidates = sorted(
+        (abs(seg_len - ln), ctg) for ctg, ln in length_map.items()
+        if abs(seg_len - ln) <= tol and ctg not in used)
+    if not candidates:
+        return None
+    if len(candidates) > 1 and candidates[0][0] == candidates[1][0]:
+        return None  # tie — ambiguous
+    return candidates[0][1]
+
+
+def _parse_gfa_topology_single(gfa_file: str, length_map: dict = None) -> dict:
+    """Parse one GFA file — see parse_gfa_topology for the multi-file wrapper."""
     if not gfa_file or not os.path.exists(gfa_file):
         return {}
 
@@ -1433,25 +1446,54 @@ def parse_gfa_topology(gfa_file: str, length_map: dict = None) -> dict:
             topology[seg] = {"topology": comp["topology"], "hairpin": comp["hairpin"]}
 
     if length_map:
-        # Build inverse: length → contig_id, skipping any ambiguous lengths
-        len_to_ctg: dict = {}
-        for ctg_id, ctg_len in length_map.items():
-            if ctg_len in len_to_ctg:
-                len_to_ctg[ctg_len] = None  # collision — mark ambiguous
-            else:
-                len_to_ctg[ctg_len] = ctg_id
-
         remapped = {}
+        used_ctgs = set()
         for seg, topo in topology.items():
             if seg in length_map:
                 remapped[seg] = topo          # name already matches a contig ID
+                used_ctgs.add(seg)
             else:
-                ln = seg_lengths.get(seg)
-                ctg_id = len_to_ctg.get(ln) if ln else None
-                remapped[ctg_id if ctg_id else seg] = topo
+                ctg_id = _closest_contig_by_length(seg_lengths.get(seg), length_map, used_ctgs)
+                if ctg_id:
+                    remapped[ctg_id] = topo
+                    used_ctgs.add(ctg_id)
+                else:
+                    remapped[seg] = topo      # left unmapped — no confident match
         topology = remapped
 
     return topology
+
+
+def parse_gfa_topology(gfa_file, length_map: dict = None) -> dict:
+    """
+    Parse a GFA assembly graph (Flye/Unicycler/Plassembler output) and
+    classify each segment's connected component as circular / linear /
+    fragmented, walking the strand-aware graph rather than just counting
+    link degree (see module comment above).
+
+    gfa_file: a single path, or a list of paths (e.g. Hybracter's Flye
+    assembly_graph.gfa *and* its Plassembler GFA — Flye's graph typically
+    only covers the chromosome and any large plasmids it managed to
+    resolve, while smaller/low-coverage plasmids are Plassembler-only and
+    never appear in Flye's graph at all; passing both lets each contribute
+    topology for the contigs it actually covers). Results are merged,
+    first file wins on any contig id collision.
+
+    Returns a dict: contig_id → {"topology": ..., "hairpin": bool}.
+
+    length_map: optional {contig_id: seq_length} built from FASTA records.
+    When GFA segment names differ from FASTA contig IDs (e.g. Plassembler's
+    numeric names, or Flye's own edge_N/contig_N naming against Hybracter's
+    final chromosome00001/plasmid00001 ids) segments are re-keyed by
+    matching their length against the provided lengths, within a small
+    tolerance (see _closest_contig_by_length).
+    """
+    files = [gfa_file] if isinstance(gfa_file, str) else list(gfa_file or [])
+    merged: dict = {}
+    for f in files:
+        for ctg_id, topo in _parse_gfa_topology_single(f, length_map).items():
+            merged.setdefault(ctg_id, topo)
+    return merged
 
 
 def is_linear_in_gfa(contig_id: str, gfa_topology: dict) -> dict:
@@ -2644,23 +2686,27 @@ def run_single_assembly(args) -> list:
     if not annot_df.empty:
         print(f"[INFO] Loaded annotation: {len(annot_df)} features")
 
-    # Parse GFA — pass length map so numeric Plassembler segment names are
-    # remapped to FASTA contig IDs via sequence-length matching.
+    # Parse GFA — pass length map so numeric Plassembler/Flye segment names
+    # are remapped to FASTA contig IDs via sequence-length matching.
+    # args.gfa may be a single path or a list (e.g. Hybracter batch mode
+    # passes both Flye's and Plassembler's GFA — see parse_gfa_topology).
     length_map = {r.id: len(r.seq) for r in records}
     gfa_topology = parse_gfa_topology(args.gfa, length_map) if args.gfa else {}
     if gfa_topology:
         print(f"[INFO] Loaded GFA topology: {len(gfa_topology)} segments")
 
     if args.gfa and getattr(args, "annotate_gfa_hairpins", False):
-        ann = annotate_gfa_hairpins(
-            args.gfa, k=getattr(args, "hairpin_k", 31),
-            window=getattr(args, "hairpin_window", 50_000),
-            min_shared=getattr(args, "hairpin_min_shared", 25),
-            edge_tol=getattr(args, "hairpin_edge_tol", 100))
-        if ann["n_added"]:
-            print(f"[INFO] Annotated {ann['n_added']} hairpin link(s) → {ann['out_path']}")
-        else:
-            print("[INFO] --annotate-gfa-hairpins: no terminal hairpins detected in GFA segments")
+        gfa_files = [args.gfa] if isinstance(args.gfa, str) else list(args.gfa)
+        for gfa_file in gfa_files:
+            ann = annotate_gfa_hairpins(
+                gfa_file, k=getattr(args, "hairpin_k", 31),
+                window=getattr(args, "hairpin_window", 50_000),
+                min_shared=getattr(args, "hairpin_min_shared", 25),
+                edge_tol=getattr(args, "hairpin_edge_tol", 100))
+            if ann["n_added"]:
+                print(f"[INFO] Annotated {ann['n_added']} hairpin link(s) → {ann['out_path']}")
+            else:
+                print(f"[INFO] --annotate-gfa-hairpins: no terminal hairpins detected in {gfa_file}")
 
     # AMRFinderPlus — run once on the whole assembly (nucleotide mode), hits
     # attributed back to each contig via its own Contig id column
@@ -2921,7 +2967,12 @@ def main():
             sample_args = copy.deepcopy(args)
             sample_args.input = s["fasta"]
             if not sample_args.gfa:
-                sample_args.gfa = s["flye_gfa"] or s["plassembler_gfa"]
+                # Pass both — Flye's graph typically only covers the
+                # chromosome and any large plasmids it resolved; smaller/
+                # low-coverage plasmids are often Plassembler-only and never
+                # appear in Flye's graph at all. parse_gfa_topology merges
+                # topology from whichever file(s) actually cover each contig.
+                sample_args.gfa = [g for g in (s["flye_gfa"], s["plassembler_gfa"]) if g]
 
             if s["contig_stats_tsv"]:
                 stats = parse_hybracter_contig_stats(s["contig_stats_tsv"])
