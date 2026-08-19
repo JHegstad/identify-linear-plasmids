@@ -159,10 +159,43 @@ LINEAR_PLASMID_IS = [
 #     asymmetric_ends/detect_asymmetric_ends) and scored only 30.8% identity
 #     (chance level) on the literal pELF1 reference sequence — this metric tests
 #     the wrong biological hypothesis for the plasmids this tool targets.
+# A third category was pulled from scoring on 2026-08-19 without being deleted
+# outright (unlike the two above, it may come back):
+#   - invertron_tp_gene: keyword match against INVERTRON_TP_GENE_KEYWORDS in the
+#     annotation. On every test run so far this has never actually matched —
+#     the keyword list (e.g. "tp", "tpg", "tap") hasn't hit real Prokka/Bakta
+#     product strings — so the weight was dead points. detect_asymmetric_ends()
+#     still computes has_tp_gene and reports it in the TSV/JSON as an
+#     informational field; only the scoring contribution is removed. Its 5
+#     points were folded into asymmetric_ends, the category it's conceptually
+#     part of and whose bam_asymmetric path remains independently reachable.
+#     Reinstate the weight if/when a real annotation run actually produces a
+#     terminal-protein-gene hit.
+# A fourth category was pulled from scoring on 2026-08-19, also without being
+# deleted outright:
+#   - assembler_not_circular: explicit circular=false in the assembler FASTA
+#     header. Never observed to fire on a plasmid-sized contig across every
+#     test report and real batch run checked (LC495616, 51525510, and the
+#     46-contig AUTOCYCLER_OUT_020726 batch) — headers are either missing the
+#     circular= flag entirely or assert circular=true; none of the upstream
+#     assemblers in current use (Autocycler, Hybracter, Flye+Plassembler)
+#     emit an explicit circular=false on plasmid-sized output in practice.
+#     Worse, on *chromosome*-sized contigs it used to fire incorrectly and
+#     contribute real points before the is_chromosome hard-gate (bb950ce)
+#     started excluding those regardless of circular= — a poorly-resolved
+#     Flye+Plassembler chromosome that failed to close emitted circular=false
+#     and scored 13 points toward two chromosomes reaching HIGH/MEDIUM. The
+#     hard-gate now neutralises that failure mode, but the category still had
+#     no positive signal to show for itself on real plasmid data, so it's
+#     retired the same way as invertron_tp_gene. assess_header_metadata()
+#     still computes assembler_not_circular and it remains visible in the
+#     JSON `header` block; only the scoring contribution is removed. Its 13
+#     points were folded into assembly_graph_linear, the category that now
+#     carries the "is this assembly actually open/linear" structural signal
+#     directly from graph topology rather than trusting a self-reported flag.
 SCORING_WEIGHTS = {
     "hairpin_end":               8,   # Hairpin/palindromic end structure
-    "asymmetric_ends":           6,   # One hairpin + one invertron end (pELF1-type, Hashimoto 2019)
-    "invertron_tp_gene":         5,   # Terminal protein gene present (invertron end)
+    "asymmetric_ends":          11,   # One hairpin + one invertron end (pELF1-type, Hashimoto 2019)
     "size_range":                4,   # Size consistent with known linear plasmids
     "gc_deviation":              4,   # GC% lower than typical chromosome
     "par_system":                4,   # ParA/ParB partition system
@@ -178,11 +211,10 @@ SCORING_WEIGHTS = {
     "skani_hit_linear_db":       8,   # SKANI hit explicitly to a *linear* plasmid sequence
     "plasmid_finder_no_hit":     4,   # No PlasmidFinder hit (novel rep = typical of linear, H.2019)
     "coverage_drop_ends":        4,   # Coverage drop at contig ends (hairpin inaccessibility, Hashimoto 2019)
-    "assembly_graph_linear":     6,   # Assembly graph linear topology
+    "assembly_graph_linear":    19,   # Assembly graph linear topology
     "enterococcal_markers":      5,   # pELF-specific markers
     "copy_number_low":           2,   # ~1 copy/cell (characteristic)
     # ── FASTA header metadata (Unicycler / Plassembler / Hybracter output) ──
-    "assembler_not_circular":   13,   # Explicit circular=false in header
     "header_copy_number":        4,   # Copy number in header consistent with plasmid (~0.3–4x)
 }
 
@@ -190,7 +222,7 @@ SCORING_WEIGHTS = {
 # These are zeroed out when annotation falls back to assembly-wide features.
 CONTIG_SPECIFIC_SCORES = {
     "par_system", "repb_rep2", "ftsK_parA_repB_combo", "tas_system",
-    "is_elements", "enterococcal_markers", "invertron_tp_gene",
+    "is_elements", "enterococcal_markers",
 }
 
 # Contigs with circular=true in header are disqualified from gene-based scoring.
@@ -305,7 +337,8 @@ def assess_header_metadata(meta: dict, chromosome_depth: float = None,
     Interpret header metadata for linear plasmid evidence.
 
     Assembler topology signal:
-      assembler_not_circular  (weight 13): explicit circular=false in header
+      assembler_not_circular  (NOT scored, see SCORING_WEIGHTS comment block):
+                               explicit circular=false in header
       circular=true           → disqualifies gene-based scoring; not a positive signal
 
     circular_flag_absent is still recorded (diagnostic / TSV output) but is NOT
@@ -1745,9 +1778,8 @@ def compute_score(evidence: dict) -> dict:
     hdr = evidence.get("header", {})
     is_confirmed_circular = hdr.get("is_circular", False)
 
-    if hdr.get("assembler_not_circular"):
-        score += SCORING_WEIGHTS["assembler_not_circular"]
-        breakdown["assembler_not_circular"] = SCORING_WEIGHTS["assembler_not_circular"]
+    # assembler_not_circular is NOT scored (see SCORING_WEIGHTS comment block
+    # above) — never observed to fire on plasmid-sized contigs in practice.
     # circular_flag_absent is NOT scored (see assess_header_metadata docstring) —
     # it fires whenever header metadata is simply missing, not when linearity is
     # actually confirmed, so it carries no discriminating evidence value.
@@ -1774,11 +1806,6 @@ def compute_score(evidence: dict) -> dict:
     if asym.get("asymmetric_pelf_type"):
         score += SCORING_WEIGHTS["asymmetric_ends"]
         breakdown["asymmetric_ends"] = SCORING_WEIGHTS["asymmetric_ends"]
-
-    # Invertron terminal protein gene
-    if asym.get("has_tp_gene"):
-        score += SCORING_WEIGHTS["invertron_tp_gene"]
-        breakdown["invertron_tp_gene"] = SCORING_WEIGHTS["invertron_tp_gene"]
 
     # 3. Size
     if evidence.get("size", {}).get("in_known_range"):
@@ -2576,9 +2603,12 @@ def analyse_contig(record, args, annot_df, gfa_topology, ref_gc=None,
     # resolved assembly that fails to close the chromosome into a circle
     # emits circular=false on a multi-Mb contig, which used to sail straight
     # through ungated *and* collect assembler_not_circular's 13 points for
-    # "not circular" on top. Confirmed in practice on a reduced-assembler
-    # (Flye+Plassembler-only) consensus run: two full chromosomes scored
-    # 42 HIGH and 31 MEDIUM as linear-plasmid candidates before this fix.
+    # "not circular" on top (assembler_not_circular has since been retired
+    # from scoring entirely — see SCORING_WEIGHTS comment block — but the
+    # size gate below stays regardless of which header signals are scored).
+    # Confirmed in practice on a reduced-assembler (Flye+Plassembler-only)
+    # consensus run: two full chromosomes scored 42 HIGH and 31 MEDIUM as
+    # linear-plasmid candidates before this fix.
     evidence["is_chromosome"] = len(seq) > 500_000 or "chromosome" in cid.lower()
 
     # Structural (hairpin, invertron end)
