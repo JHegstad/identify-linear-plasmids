@@ -629,7 +629,7 @@ def detect_asymmetric_ends(hairpin_ends: dict,
 # ─────────────────────────────────────────────────────────────────────────────
 
 def detect_idr_tata_ends(seq: str, search_window: int = 150,
-                          min_arm: int = 6, max_arm: int = 40,
+                          min_arm: int = 8, max_arm: int = 40,
                           max_loop: int = 16, min_identity: float = 0.80) -> dict:
     """
     Search for an IDR-loop-IDR hairpin telomere structure at each sequence end.
@@ -728,11 +728,16 @@ def detect_coverage_drop_ends(bam_file, contig_id: str,
 
     Two complementary checks are run:
 
-    Wide window (<end_window> bp, default 5 kb), threshold < 50% of body depth:
+    Wide window (<end_window> bp, default 5 kb), threshold < 30% of body depth:
       Fires when the assembled hairpin arm is present in the contig and Illumina
       reads cannot be generated from it (adapter ligation blocked by the hairpin
       fold, Hashimoto 2019, Fig 3A). Also fires with ONT reads when mappability
-      is reduced across the palindromic terminal region.
+      is reduced across the palindromic terminal region. (Threshold tightened
+      2026-08 from 50%->30%: validated on efm-circular-plasmids negative-control
+      batch, where end-of-contig depth on genuinely circular replicons routinely
+      dipped to 34-70% of body depth from the arbitrary circularization-seam cut
+      — well above 30% — while the one confirmed linear-plasmid positive
+      (LC495616.1/pELF1) sits at 24%/16%, comfortably below.)
 
     Narrow tip window (<tip_window> bp, default 10 bp), threshold < 10% of body depth:
       Fires when the assembly was TRUNCATED at the palindrome centre — the hairpin
@@ -790,20 +795,24 @@ def detect_coverage_drop_ends(bam_file, contig_id: str,
         tip_left_drop  = tip_left_ratio  < 0.10
         tip_right_drop = tip_right_ratio < 0.10
 
+        # Wide-window drop threshold (tightened 2026-08 from 0.50; see docstring)
+        wide_drop_threshold = 0.30
+        left_drop  = left_ratio  < wide_drop_threshold
+        right_drop = right_ratio < wide_drop_threshold
+
         result = {
             "available":          True,
             "left_depth_ratio":   round(left_ratio,  3),
             "right_depth_ratio":  round(right_ratio, 3),
             "body_mean_depth":    round(avg_body, 1),
-            "left_drop":          left_ratio  < 0.50,
-            "right_drop":         right_ratio < 0.50,
+            "left_drop":          left_drop,
+            "right_drop":         right_drop,
             "left_tip_ratio":     round(tip_left_ratio,  3),
             "right_tip_ratio":    round(tip_right_ratio, 3),
             "left_tip_drop":      tip_left_drop,
             "right_tip_drop":     tip_right_drop,
             "consistent_with_linear": (
-                left_ratio  < 0.50 or right_ratio  < 0.50 or
-                tip_left_drop       or tip_right_drop
+                left_drop or right_drop or tip_left_drop or tip_right_drop
             ),
         }
         if close_when_done:
@@ -1714,7 +1723,7 @@ def interpret_blast_hits(blast_df: pd.DataFrame) -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_skani(query_fasta: str, db: str, out_file: str,
-              min_ani: float = 90.0, min_af: float = 0.05,
+              min_ani: float = 90.0, min_af: float = 0.50,
               n_results: int = 5) -> pd.DataFrame:
     """Run skani against a plasmid database and return a normalised DataFrame.
 
@@ -2941,8 +2950,13 @@ def main():
                              "skani sketch -l db.fna -o db_dir/")
     parser.add_argument("--skani-ani", type=float, default=90.0,
                         help="Minimum SKANI ANI %%%% (default: 90)")
-    parser.add_argument("--skani-af",  type=float, default=0.05,
-                        help="Minimum SKANI query alignment fraction (default: 0.05)")
+    parser.add_argument("--skani-af",  type=float, default=0.50,
+                        help="Minimum SKANI query alignment fraction (default: 0.50). "
+                             "Tightened 2026-08 from 0.05: at that setting, a query "
+                             "sharing only a composite-transposon-sized block (~10 kb, "
+                             "~28%% AF) with a linear-plasmid-db reference — e.g. shared "
+                             "IS1216 cassette content rather than whole-replicon "
+                             "relatedness — still counted as a linear-plasmid hit.")
     parser.add_argument("--chromosome-contigs", nargs="*", default=[],
                         help="Contig IDs of chromosome (for copy number normalisation)")
     parser.add_argument("--ref-gc", type=float, default=None,
