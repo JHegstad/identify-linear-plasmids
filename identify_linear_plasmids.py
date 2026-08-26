@@ -154,9 +154,7 @@ LINEAR_PLASMID_IS = [
 #
 # Rescaled 2026-07 so the realistic achievable ceiling (accounting for the
 # mutually-exclusive blast_hit/blast_hit_linear_db and skani_hit/skani_hit_linear_db
-# tiers, see compute_score) was exactly 100; the ceiling is now 104 following
-# the 2026-08 addition of boundary_clip_absent (see below and
-# detect_boundary_clip_signature). Two categories were removed outright
+# tiers, see compute_score) is exactly 100. Two categories were removed outright
 # during revalidation against known-positive linear plasmids (pELF1 reference,
 # 51525510):
 #   - circular_flag_absent: fired on every test run regardless of true topology —
@@ -202,6 +200,23 @@ LINEAR_PLASMID_IS = [
 #     points were folded into assembly_graph_linear, the category that now
 #     carries the "is this assembly actually open/linear" structural signal
 #     directly from graph topology rather than trusting a self-reported flag.
+# A fifth category was added 2026-08 and reverted the same day:
+#   - boundary_clip_absent: soft/hard-clip pile-up at contig boundaries (see
+#     detect_boundary_clip_signature) — sensitivity looked clean on
+#     Illumina-mapped pELF1/pELF2 (ratio 0.0-0.34), but once genuine
+#     Illumina data became available for the six circular negative controls
+#     (previously only long-read data was staged for them, an unnoticed
+#     technology confound), specificity collapsed: 4 of 6 negative controls
+#     scored *below* seam_ratio_threshold=1.0 (i.e. falsely "consistent with
+#     linear"), and the ranges frankly overlap — KresLRE-14's ratios
+#     (0.124, 0.079) are lower than pELF1's own right-end ratio (0.323). No
+#     threshold on this ratio cleanly separates the two groups. The
+#     detection function and its evidence (`evidence["boundary_clip"]`)
+#     remain in the JSON output for diagnostic purposes; only the scoring
+#     contribution is removed. Reinstate only after a redesigned signal
+#     (e.g. a different normalization, or requiring corroborating GFA/
+#     coverage evidence) is validated against this same real Illumina
+#     negative-control set.
 SCORING_WEIGHTS = {
     "hairpin_end":               8,   # Hairpin/palindromic end structure
     "asymmetric_ends":          11,   # One hairpin + one invertron end (pELF1-type, Hashimoto 2019)
@@ -220,7 +235,6 @@ SCORING_WEIGHTS = {
     "skani_hit_linear_db":       8,   # SKANI hit explicitly to a *linear* plasmid sequence
     "plasmid_finder_no_hit":     4,   # No PlasmidFinder hit (novel rep = typical of linear, H.2019)
     "coverage_drop_ends":        4,   # Coverage drop at contig ends (hairpin inaccessibility, Hashimoto 2019)
-    "boundary_clip_absent":      4,   # No soft/hard-clip pile-up at contig ends (absence of circular-seam signature)
     "assembly_graph_linear":    19,   # Assembly graph linear topology
     "enterococcal_markers":      5,   # pELF-specific markers
     "copy_number_low":           2,   # ~1 copy/cell (characteristic)
@@ -2110,18 +2124,13 @@ def compute_score(evidence: dict) -> dict:
         score += SCORING_WEIGHTS["coverage_drop_ends"]
         breakdown["coverage_drop_ends"] = SCORING_WEIGHTS["coverage_drop_ends"]
 
-    # 10b. Absence of terminal soft/hard-clip pile-up (no circular-seam
-    # signature, see detect_boundary_clip_signature). Scores only when both
-    # ends are clean AND the BAM is short-read (scoring_eligible) — a
-    # controlled ONT-vs-Illumina comparison on the same pELF1 contig showed
-    # long reads produce a false seam flag, so long-read BAMs are excluded
-    # from scoring here even though the raw ratios are still reported for
-    # diagnostics.
-    bclip = evidence.get("boundary_clip", {})
-    if (bclip.get("available") and bclip.get("scoring_eligible")
-            and bclip.get("consistent_with_linear")):
-        score += SCORING_WEIGHTS["boundary_clip_absent"]
-        breakdown["boundary_clip_absent"] = SCORING_WEIGHTS["boundary_clip_absent"]
+    # 10b. boundary_clip (detect_boundary_clip_signature) is NOT scored — see
+    # SCORING_WEIGHTS comment block ("fifth category... reverted the same
+    # day"). Specificity collapsed once genuine Illumina data was available
+    # for the negative controls: 4/6 falsely came back "consistent with
+    # linear", with ranges overlapping the positive controls. The evidence
+    # is still collected (evidence["boundary_clip"]) and left in the JSON
+    # output for diagnostic purposes only.
 
     # 11. Assembly graph
     gfa = evidence.get("gfa_topology", {})
