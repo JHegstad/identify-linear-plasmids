@@ -893,24 +893,28 @@ def detect_boundary_clip_signature(bam_file, contig_id: str, contig_len: int,
     genuine hairpin terminus than a coverage drop that also shows heavy
     boundary clipping.
 
-    Validated 2026-08 against pELF1/pELF2 (positive controls, hairpin
-    termini) vs. six circular E. faecium megaplasmid negative controls (all
-    circular=true in the assembler header): boundary-clip-count / body-depth
-    ratio was 0.0-0.34 at both ends of both positive contigs, and 2.6-7.5 at
-    both ends of all six negative contigs — a >7x margin with zero overlap.
-    seam_ratio_threshold=1.0 (clipped reads at the tip reach/exceed local body
-    depth) sits comfortably in that gap.
+    Sensitivity validated 2026-08 on Illumina-mapped pELF1/pELF2 (positive
+    controls, confirmed hairpin termini): boundary-clip-count / body-depth
+    ratio was 0.0-0.34 at both ends of both contigs, comfortably under
+    seam_ratio_threshold=1.0 (clipped reads at the tip reach/exceed local
+    body depth). NOTE — specificity (does the threshold actually flag a
+    genuine circular contig on Illumina data) is NOT yet directly validated:
+    the six circular E. faecium negative controls staged for this project
+    only have long-read (ONT/HiFi) data, not Illumina, so no confirmed-
+    circular short-read sample has been run through this function. Treat
+    seam_ratio_threshold=1.0 as a reasonable but provisional choice pending
+    an Illumina-mapped circular validation sample.
 
     Short-read-only signal: a controlled comparison (2026-08, identical pELF1
-    assembly/contig, ONT vs. Illumina reads) showed ONT produces a false
-    circular-seam flag at the left end (ratio 1.94, vs. 0.0 for the same
-    contig/end mapped with Illumina) — long reads apparently clip more freely
-    through the palindromic hairpin/IDR structure itself (higher per-base
-    error rate, lower fidelity through the fold-back), which this method
-    cannot distinguish from a genuine seam artefact. mean_read_len is sampled
-    from the body region and used to gate scoring_eligible (<=500 bp only);
-    long-read BAMs still get ratios/flags reported here for diagnostic
-    purposes but are excluded from scoring (see compute_score).
+    assembly/contig, ONT vs. Illumina reads, post pileup-truncate-bug-fix —
+    see body_depths below) gave ratio 0.64 for ONT vs. 0.0 for Illumina at
+    the same end — below seam_ratio_threshold either way here, but a 6x
+    elevation on a single linear-plasmid data point is enough noise that a
+    different long-read run could plausibly cross the threshold and produce
+    a false seam flag. mean_read_len is sampled from the body region and
+    used to gate scoring_eligible (<=500 bp only); long-read BAMs still get
+    ratios/flags reported here for diagnostic purposes but are excluded from
+    scoring (see compute_score) until validated.
 
     Returns dict with:
       available              : bool
@@ -964,9 +968,15 @@ def detect_boundary_clip_signature(bam_file, contig_id: str, contig_len: int,
 
         mid  = contig_len // 2
         half = min(body_window, max(500, contig_len // 4))
+        # truncate=True: without it, pysam.pileup() yields columns for a
+        # read's *entire* aligned span whenever it merely overlaps the
+        # queried region — on long-read BAMs a single read spanning far
+        # beyond this small body window drags the mean depth down with
+        # spurious out-of-window columns (see detect_coverage_drop_ends /
+        # commit 62d7b6f, same bug class).
         body_depths = [col.nsegments for col in bam.pileup(
             contig_id, max(0, mid - half), min(contig_len, mid + half),
-            min_mapping_quality=0)]
+            min_mapping_quality=0, truncate=True)]
         avg_body = mean(body_depths) if body_depths else 0
 
         # Read-technology gate — see docstring. Sampled from the same body
