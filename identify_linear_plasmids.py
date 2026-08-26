@@ -154,7 +154,9 @@ LINEAR_PLASMID_IS = [
 #
 # Rescaled 2026-07 so the realistic achievable ceiling (accounting for the
 # mutually-exclusive blast_hit/blast_hit_linear_db and skani_hit/skani_hit_linear_db
-# tiers, see compute_score) is exactly 100. Two categories were removed outright
+# tiers, see compute_score) was exactly 100; the ceiling is now 104 following
+# the 2026-08 addition of boundary_clip_absent (see below and
+# detect_boundary_clip_signature). Two categories were removed outright
 # during revalidation against known-positive linear plasmids (pELF1 reference,
 # 51525510):
 #   - circular_flag_absent: fired on every test run regardless of true topology —
@@ -218,6 +220,7 @@ SCORING_WEIGHTS = {
     "skani_hit_linear_db":       8,   # SKANI hit explicitly to a *linear* plasmid sequence
     "plasmid_finder_no_hit":     4,   # No PlasmidFinder hit (novel rep = typical of linear, H.2019)
     "coverage_drop_ends":        4,   # Coverage drop at contig ends (hairpin inaccessibility, Hashimoto 2019)
+    "boundary_clip_absent":      4,   # No soft/hard-clip pile-up at contig ends (absence of circular-seam signature)
     "assembly_graph_linear":    19,   # Assembly graph linear topology
     "enterococcal_markers":      5,   # pELF-specific markers
     "copy_number_low":           2,   # ~1 copy/cell (characteristic)
@@ -852,6 +855,149 @@ def detect_coverage_drop_ends(bam_file, contig_id: str,
             "consistent_with_linear": (
                 left_drop or right_drop or tip_left_drop or tip_right_drop
             ),
+        }
+        if close_when_done:
+            bam.close()
+        return result
+    except Exception as e:
+        if close_when_done:
+            try:
+                bam_file.close()
+            except Exception:
+                pass
+        return {"available": False, "message": str(e)}
+
+
+def detect_boundary_clip_signature(bam_file, contig_id: str, contig_len: int,
+                                    tip_window: int = 100,
+                                    body_window: int = 2000,
+                                    seam_ratio_threshold: float = 1.0) -> dict:
+    """
+    Detect soft-/hard-clip pile-up exactly at the contig boundaries — the
+    signature of reads spanning an artificial circularization seam.
+
+    Mechanism: when a circular molecule is linearized for mapping/assembly,
+    reads whose true template spans the arbitrary cut point align cleanly up
+    to the boundary and have the wrapped-around remainder (absent from the
+    linear reference) reported as a soft clip (or hard clip, for
+    supplementary/secondary records) right at position 0 (left end) / at
+    contig_len (right end). A genuinely linear molecule with a real physical
+    terminus (e.g. a covalently closed hairpin) has no such seam, so reads
+    terminate there cleanly and this pile-up sits at or near zero.
+
+    This is the counterpart to detect_coverage_drop_ends: that check looks for
+    a *depth* drop at the ends (hairpin blocks read generation); this one
+    looks for a *clip* pile-up at the ends (circular seam redirects reads).
+    The two mechanisms are distinguishable and can even co-occur diagnostically
+    — a coverage drop with no accompanying clip pile-up is much more likely a
+    genuine hairpin terminus than a coverage drop that also shows heavy
+    boundary clipping.
+
+    Validated 2026-08 against pELF1/pELF2 (positive controls, hairpin
+    termini) vs. six circular E. faecium megaplasmid negative controls (all
+    circular=true in the assembler header): boundary-clip-count / body-depth
+    ratio was 0.0-0.34 at both ends of both positive contigs, and 2.6-7.5 at
+    both ends of all six negative contigs — a >7x margin with zero overlap.
+    seam_ratio_threshold=1.0 (clipped reads at the tip reach/exceed local body
+    depth) sits comfortably in that gap.
+
+    Short-read-only signal: a controlled comparison (2026-08, identical pELF1
+    assembly/contig, ONT vs. Illumina reads) showed ONT produces a false
+    circular-seam flag at the left end (ratio 1.94, vs. 0.0 for the same
+    contig/end mapped with Illumina) — long reads apparently clip more freely
+    through the palindromic hairpin/IDR structure itself (higher per-base
+    error rate, lower fidelity through the fold-back), which this method
+    cannot distinguish from a genuine seam artefact. mean_read_len is sampled
+    from the body region and used to gate scoring_eligible (<=500 bp only);
+    long-read BAMs still get ratios/flags reported here for diagnostic
+    purposes but are excluded from scoring (see compute_score).
+
+    Returns dict with:
+      available              : bool
+      left_clip_ratio         : float  (left-tip clip count / body mean depth)
+      right_clip_ratio        : float
+      left_seam_flag          : bool   (left_clip_ratio  >= seam_ratio_threshold)
+      right_seam_flag         : bool   (right_clip_ratio >= seam_ratio_threshold)
+      consistent_with_linear  : bool   (neither end shows a seam signature)
+      body_mean_depth         : float
+      mean_read_len           : float  (sampled from body region)
+      scoring_eligible        : bool   (short-read data only, mean_read_len <= 500 bp)
+    """
+    try:
+        import pysam
+    except ImportError:
+        return {"available": False, "message": "pysam not installed"}
+
+    close_when_done = False
+    if isinstance(bam_file, str):
+        if not bam_file or not os.path.exists(bam_file):
+            return {"available": False, "message": "BAM not found"}
+        try:
+            bam_file = pysam.AlignmentFile(bam_file, "rb")
+            close_when_done = True
+        except Exception as e:
+            return {"available": False, "message": str(e)}
+
+    SOFT, HARD = 4, 5
+    try:
+        bam = bam_file
+
+        def tip_clip_count(region_start, region_end, at_start: bool) -> int:
+            count = 0
+            seen = set()
+            for read in bam.fetch(contig_id, region_start, region_end):
+                if read.is_unmapped or not read.cigartuples:
+                    continue
+                uid = (read.query_name, read.reference_start, read.flag)
+                if uid in seen:
+                    continue
+                seen.add(uid)
+                cigar = read.cigartuples
+                if at_start:
+                    if read.reference_start < region_end and cigar[0][0] in (SOFT, HARD):
+                        count += 1
+                else:
+                    ref_end = read.reference_end or read.reference_start
+                    if ref_end > region_start and cigar[-1][0] in (SOFT, HARD):
+                        count += 1
+            return count
+
+        mid  = contig_len // 2
+        half = min(body_window, max(500, contig_len // 4))
+        body_depths = [col.nsegments for col in bam.pileup(
+            contig_id, max(0, mid - half), min(contig_len, mid + half),
+            min_mapping_quality=0)]
+        avg_body = mean(body_depths) if body_depths else 0
+
+        # Read-technology gate — see docstring. Sampled from the same body
+        # region (cheap: capped at 200 reads).
+        read_lens = []
+        for read in bam.fetch(contig_id, max(0, mid - half), min(contig_len, mid + half)):
+            if read.query_length:
+                read_lens.append(read.query_length)
+            if len(read_lens) >= 200:
+                break
+        mean_read_len    = mean(read_lens) if read_lens else 0
+        scoring_eligible = 0 < mean_read_len <= 500
+
+        left_tip  = tip_clip_count(0, min(tip_window, contig_len), at_start=True)
+        right_tip = tip_clip_count(max(0, contig_len - tip_window), contig_len, at_start=False)
+
+        left_ratio  = left_tip  / avg_body if avg_body > 0 else 0
+        right_ratio = right_tip / avg_body if avg_body > 0 else 0
+        left_seam   = left_ratio  >= seam_ratio_threshold
+        right_seam  = right_ratio >= seam_ratio_threshold
+
+        result = {
+            "available":             True,
+            "left_clip_ratio":       round(left_ratio,  3),
+            "right_clip_ratio":      round(right_ratio, 3),
+            "left_seam_flag":        left_seam,
+            "right_seam_flag":       right_seam,
+            "consistent_with_linear": not (left_seam or right_seam),
+            "body_mean_depth":       round(avg_body, 1),
+            "mean_read_len":         round(mean_read_len, 1),
+            "scoring_eligible":      scoring_eligible,
         }
         if close_when_done:
             bam.close()
@@ -1954,6 +2100,19 @@ def compute_score(evidence: dict) -> dict:
         score += SCORING_WEIGHTS["coverage_drop_ends"]
         breakdown["coverage_drop_ends"] = SCORING_WEIGHTS["coverage_drop_ends"]
 
+    # 10b. Absence of terminal soft/hard-clip pile-up (no circular-seam
+    # signature, see detect_boundary_clip_signature). Scores only when both
+    # ends are clean AND the BAM is short-read (scoring_eligible) — a
+    # controlled ONT-vs-Illumina comparison on the same pELF1 contig showed
+    # long reads produce a false seam flag, so long-read BAMs are excluded
+    # from scoring here even though the raw ratios are still reported for
+    # diagnostics.
+    bclip = evidence.get("boundary_clip", {})
+    if (bclip.get("available") and bclip.get("scoring_eligible")
+            and bclip.get("consistent_with_linear")):
+        score += SCORING_WEIGHTS["boundary_clip_absent"]
+        breakdown["boundary_clip_absent"] = SCORING_WEIGHTS["boundary_clip_absent"]
+
     # 11. Assembly graph
     gfa = evidence.get("gfa_topology", {})
     if gfa.get("consistent_with_linear"):
@@ -2708,9 +2867,12 @@ def analyse_contig(record, args, annot_df, gfa_topology, ref_gc=None,
             bam_src, cid, args.chromosome_contigs)
         evidence["coverage_drop"] = detect_coverage_drop_ends(
             bam_src, cid, len(seq))
+        evidence["boundary_clip"] = detect_boundary_clip_signature(
+            bam_src, cid, len(seq))
     else:
         evidence["copy_number"]   = {"available": False}
         evidence["coverage_drop"] = {"available": False}
+        evidence["boundary_clip"] = {"available": False}
 
     # Asymmetric end analysis (pELF1-type, Hashimoto 2019)
     # Runs after BAM so coverage_drop is available for the left-only drop path
