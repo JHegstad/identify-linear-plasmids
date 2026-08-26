@@ -769,7 +769,7 @@ def detect_coverage_drop_ends(bam_file, contig_id: str,
         def region_depths(start, end):
             return [col.nsegments
                     for col in bam.pileup(contig_id, start, end,
-                                          min_mapping_quality=20)]
+                                          min_mapping_quality=20, truncate=True)]
 
         body_start = end_window
         body_end   = max(contig_len - end_window, end_window + 1)
