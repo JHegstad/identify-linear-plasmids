@@ -36,6 +36,8 @@ python identify_linear_plasmids.py -i assembly.fasta \
     --shortread-r1 R1.fastq.gz --shortread-r2 R2.fastq.gz
 ```
 
+If both `--shortread-*` and `--longread-fastq` are supplied (and no explicit `--bam`), short reads are mapped first and take priority for the single shared BAM (`coverage_drop` + `copy_number`) — long reads are only auto-mapped as a fallback if short-read mapping isn't attempted or fails. This holds even when the assembly itself came from a long-read-only assembler (Flye/Autocycler/Hybracter-long): the coverage-drop check's wide-window signal is actually cleaner on Illumina data (adapter ligation is blocked outright by the hairpin fold) than on ONT (mappability is only reduced, not blocked, across the palindrome).
+
 With all optional inputs:
 ```bash
 python identify_linear_plasmids.py -i assembly.fasta \
@@ -59,12 +61,19 @@ python identify_linear_plasmids.py \
     --json -o LC495616/linear_plasmid_report
 ```
 
-With a Hybracter output directory (batch mode, one sample per assembly — auto-discovers each sample's FINAL_OUTPUT FASTA, per_contig_stats.tsv, Flye/Plassembler GFA, and Hybracter's own QC'd long reads for auto-BAM-mapping; mutually exclusive with `-i`, and `--bam`/`--longread-fastq`/`--shortread-*` are not supported alongside it):
+With a Hybracter output directory (batch mode, one sample per assembly — auto-discovers each sample's FINAL_OUTPUT FASTA, per_contig_stats.tsv, Flye/Plassembler GFA, and Hybracter's own QC'd long reads for auto-BAM-mapping; mutually exclusive with `-i`, and `--bam`/`--longread-fastq`/`--shortread-fastq`/`--shortread-r1`/`--shortread-r2` are not supported alongside it):
 ```bash
 python identify_linear_plasmids.py --hybracter-dir hybracter_out/ \
     --annot prokka.gff --skani-db skani_db/sketches --json -o batch_report
 ```
 Produces one combined `<prefix>.tsv`/`.json` across all samples, with a `sample` column.
+
+To supply matching short reads per sample in batch mode (e.g. Illumina data for samples assembled long-read-only via Flye/Autocycler/Hybracter-long), use `--shortread-dir`: a directory of FASTQs auto-matched to each sample by filename (`{sample}_R1.fastq.gz`/`{sample}_R2.fastq.gz`, `{sample}_1.fastq.gz`/`{sample}_2.fastq.gz`, or interleaved `{sample}.fastq.gz`; `.fq`/`.fq.gz` also accepted). A matched sample's short reads are mapped and take priority over Hybracter's own long reads for that sample's BAM; samples with no match fall back to long-read auto-mapping as before.
+```bash
+python identify_linear_plasmids.py --hybracter-dir hybracter_out/ \
+    --shortread-dir illumina_reads/ \
+    --annot prokka.gff --skani-db skani_db/sketches --json -o batch_report
+```
 
 ## Architecture
 
@@ -73,7 +82,7 @@ Single-file script (`identify_linear_plasmids.py`) with a modular pipeline:
 | Module | Function(s) | Purpose |
 |--------|-------------|---------|
 | 0 | `parse_fasta_header`, `assess_header_metadata` | Extract circular/copy-number metadata from assembler FASTA headers (Unicycler, Plassembler, Hybracter) |
-| 0b | `discover_hybracter_samples`, `parse_hybracter_contig_stats` | `--hybracter-dir` batch mode: per-sample FASTA/GFA/reads discovery under a Hybracter output root |
+| 0b | `discover_hybracter_samples`, `parse_hybracter_contig_stats`, `find_shortreads_for_sample` | `--hybracter-dir` batch mode: per-sample FASTA/GFA/reads discovery under a Hybracter output root; `find_shortreads_for_sample` matches `--shortread-dir` files to a sample by filename for short-read-priority BAM mapping |
 | 2 | `detect_terminal_hairpins` | Localized per-end hairpin/TIR fold-back detector (ported from linear-plasmid-hairpin-tools' `find_hairpins.py`, 2026-07) — replaces the old whole-window `detect_self_complement_ends`, which tested a symmetric-hairpin hypothesis that never fires on genuinely asymmetric ends (pELF1-type) |
 | 2c | `detect_coverage_drop_ends` | Detect coverage drop at contig ends via BAM (hairpin inaccessibility artefact) |
 | 3 | `gc_content`, `assess_gc` | GC% deviation from reference |

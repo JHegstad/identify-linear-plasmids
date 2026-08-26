@@ -31,6 +31,13 @@ Long-read mapping
     map-pb    PacBio CLR
     map-hifi  PacBio HiFi / Revio
 
+  If short-read options are also supplied, short reads are mapped first and
+  take priority for this shared BAM (Illumina adapter ligation is blocked
+  outright by a hairpin fold, a cleaner coverage-drop signal than ONT's
+  mappability reduction) — long-read auto-mapping only runs as a fallback.
+  This applies even to assemblies built long-read-only (Flye/Autocycler/
+  Hybracter-long) when matching short reads are separately available.
+
 Output: TSV report + per-contig JSON detail.
 
 Dependencies (install with pip):
@@ -441,6 +448,37 @@ def discover_hybracter_samples(hybracter_dir: str) -> list:
                 "longread_fastq":   str(longread_fastq) if longread_fastq.exists() else None,
             })
     return samples
+
+
+def find_shortreads_for_sample(shortread_dir: str, sample: str) -> dict:
+    """
+    Auto-match short-read FASTQ(s) for one Hybracter sample by filename,
+    for --shortread-dir batch mode.
+
+    Tries, in order: R1/R2 pairs under a few common suffix conventions,
+    then a single interleaved file. Returns {"interleaved": path|None,
+    "r1": path|None, "r2": path|None} — all None if nothing matched.
+    """
+    d = Path(shortread_dir)
+    if not d.is_dir():
+        return {"interleaved": None, "r1": None, "r2": None}
+
+    exts = (".fastq.gz", ".fq.gz", ".fastq", ".fq")
+    pair_suffixes = [("_R1", "_R2"), ("_1", "_2"), (".R1", ".R2")]
+
+    for s1, s2 in pair_suffixes:
+        for ext in exts:
+            r1 = d / f"{sample}{s1}{ext}"
+            r2 = d / f"{sample}{s2}{ext}"
+            if r1.exists() and r2.exists():
+                return {"interleaved": None, "r1": str(r1), "r2": str(r2)}
+
+    for ext in exts:
+        f = d / f"{sample}{ext}"
+        if f.exists():
+            return {"interleaved": str(f), "r1": None, "r2": None}
+
+    return {"interleaved": None, "r1": None, "r2": None}
 
 
 def parse_hybracter_contig_stats(tsv_path: str) -> dict:
@@ -1581,8 +1619,21 @@ def annotate_gfa_hairpins(gfa_path: str, out_path: str = None,
     Detect terminal hairpins in `gfa_path`'s segments and write a copy with
     Autocycler-style hairpin links added.
 
-    Returns {"out_path": str | None, "n_added": int, "links": [...]}.
-    out_path is None if no hairpins were found (nothing written).
+    A GFA opposite-strand self-link (L seg + seg -, or L seg - seg +) is the
+    AUTHORITATIVE hairpin signal (see linear-plasmid-hairpin-tools/find_hairpins.py)
+    — it's graph-encoded, not re-derived. This function only ADDS links for
+    segments that fold back on themselves in sequence but whose GFA doesn't
+    already say so (common for long-read-only Flye/Plassembler output, which
+    bakes the fold into the linear sequence). Segments that already carry a
+    self-link are reported separately (`pre_existing_segments`) rather than
+    silently skipped, so a caller can't mistake "nothing new to add" for
+    "no hairpin evidence at all" — parse_gfa_topology/is_linear_in_gfa already
+    reads pre-existing self-links directly and scores them independently of
+    this function.
+
+    Returns {"out_path": str | None, "n_added": int, "links": [...],
+             "pre_existing_segments": [...]}.
+    out_path is None if no NEW hairpin links were added (nothing written).
     """
     lines = []
     seqs = {}
@@ -1598,6 +1649,11 @@ def annotate_gfa_hairpins(gfa_path: str, out_path: str = None,
                 f = line.rstrip("\n").split("\t")
                 if len(f) >= 5:
                     existing_links.add((f[1], f[2], f[3], f[4]))
+
+    pre_existing_segments = sorted({
+        seg for seg, sa, seg2, sb in existing_links
+        if seg == seg2 and sa != sb
+    })
 
     new_links = []   # (seg, from_strand, to_strand, overlap_str, info_dict)
     for seg, seq in seqs.items():
@@ -1620,7 +1676,8 @@ def annotate_gfa_hairpins(gfa_path: str, out_path: str = None,
             existing_links.add((seg, sa, seg, sb))
 
     if not new_links:
-        return {"out_path": None, "n_added": 0, "links": []}
+        return {"out_path": None, "n_added": 0, "links": [],
+                "pre_existing_segments": pre_existing_segments}
 
     out = out_path or (os.path.splitext(gfa_path)[0] + ".hairpins.gfa")
     with open(out, "w") as fh:
@@ -1630,7 +1687,8 @@ def annotate_gfa_hairpins(gfa_path: str, out_path: str = None,
             fh.write(f"L\t{seg}\t{sa}\t{seg}\t{sb}\t{ov}\n")
 
     return {"out_path": out, "n_added": len(new_links),
-            "links": [info for *_, info in new_links]}
+            "links": [info for *_, info in new_links],
+            "pre_existing_segments": pre_existing_segments}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2751,8 +2809,16 @@ def run_single_assembly(args) -> list:
                 window=getattr(args, "hairpin_window", 50_000),
                 min_shared=getattr(args, "hairpin_min_shared", 25),
                 edge_tol=getattr(args, "hairpin_edge_tol", 100))
+            pre_existing = ann.get("pre_existing_segments", [])
             if ann["n_added"]:
-                print(f"[INFO] Annotated {ann['n_added']} hairpin link(s) → {ann['out_path']}")
+                msg = f"[INFO] Annotated {ann['n_added']} hairpin link(s) → {ann['out_path']}"
+                if pre_existing:
+                    msg += f"  ({len(pre_existing)} segment(s) already had one: {', '.join(pre_existing)})"
+                print(msg)
+            elif pre_existing:
+                print(f"[INFO] --annotate-gfa-hairpins: no NEW hairpin links to add — "
+                      f"{len(pre_existing)} segment(s) already carry a GFA-encoded hairpin "
+                      f"self-link ({', '.join(pre_existing)}); already scored via GFA topology.")
             else:
                 print(f"[INFO] --annotate-gfa-hairpins: no terminal hairpins detected in {gfa_file}")
 
@@ -2895,7 +2961,10 @@ def main():
     parser.add_argument("--shortread-fastq", dest="shortread_fastq",
                         metavar="INTERLEAVED.fastq.gz",
                         help="Interleaved paired-end Illumina FASTQ — mapped with "
-                             "minimap2 sr preset; produces <output-prefix>.short.sorted.bam")
+                             "minimap2 sr preset; produces <output-prefix>.short.sorted.bam. "
+                             "Takes priority over --longread-fastq: mapped first, and "
+                             "--longread-fastq is only auto-mapped if this fails to "
+                             "produce a BAM. Ignored if --bam is also given.")
     parser.add_argument("--shortread-r1", dest="shortread_r1",
                         metavar="R1.fastq.gz",
                         help="Illumina R1 FASTQ (paired-end, separate files)")
@@ -2906,6 +2975,16 @@ def main():
                         type=int, default=4,
                         help="Threads for minimap2 / samtools short-read mapping "
                              "(default: 4)")
+    parser.add_argument("--shortread-dir", dest="shortread_dir",
+                        help="--hybracter-dir batch mode only: directory of per-sample "
+                             "short-read FASTQs, auto-matched to each sample by filename "
+                             "({sample}_R1.fastq.gz/{sample}_R2.fastq.gz, "
+                             "{sample}_1.fastq.gz/{sample}_2.fastq.gz, or an interleaved "
+                             "{sample}.fastq.gz; .fq/.fq.gz also accepted). When a match "
+                             "is found it is mapped and takes priority over Hybracter's "
+                             "own long reads for that sample, even for long-read-only "
+                             "assemblies (Flye/Autocycler/Hybracter-long); samples with "
+                             "no match fall back to long-read auto-mapping as before.")
     parser.add_argument("--gfa",           help="Assembly graph GFA file (Unicycler/Flye/Plassembler)")
     parser.add_argument("--hairpin-k", dest="hairpin_k", type=int, default=31,
                         help="k-mer size for terminal hairpin detection (default: 31)")
@@ -2996,12 +3075,18 @@ def main():
     seq_maps = {}    # sample (or None in single mode) -> {contig_id: seq}, for --visualize
     sample_bams = {}  # sample (or None in single mode) -> bam path used, for --visualize
 
+    if not batch_mode and args.shortread_dir:
+        parser.error("--shortread-dir is only supported alongside --hybracter-dir "
+                     "(use --shortread-fastq/--shortread-r1/--shortread-r2 for "
+                     "-i/--input mode).")
+
     if batch_mode:
         if args.bam or args.longread_fastq or _sr_interleaved or _sr_r1:
-            parser.error("--bam/--longread-fastq/--shortread-* are not supported "
-                         "alongside --hybracter-dir (ambiguous across multiple "
-                         "samples) — Hybracter's own QC'd long reads are "
-                         "auto-mapped per sample instead.")
+            parser.error("--bam/--longread-fastq/--shortread-fastq/--shortread-r1/"
+                         "--shortread-r2 are not supported alongside --hybracter-dir "
+                         "(ambiguous across multiple samples) — use --shortread-dir "
+                         "for per-sample short reads; Hybracter's own QC'd long reads "
+                         "are auto-mapped per sample as a fallback.")
 
         samples = discover_hybracter_samples(args.hybracter_dir)
         if not samples:
@@ -3036,7 +3121,34 @@ def main():
                         print(f"[INFO] Chromosome contig(s) from per_contig_stats.tsv: "
                               f"{', '.join(sample_args.chromosome_contigs)}")
 
-            if s["longread_fastq"]:
+            # Short reads take priority (cleaner coverage-drop signal — Illumina
+            # adapter ligation is blocked outright by a hairpin fold, vs. ONT's
+            # more variable mappability reduction across the palindrome) — even
+            # for long-read-only assemblies (Flye/Autocycler/Hybracter-long),
+            # if a matching short-read file is found under --shortread-dir.
+            # Long reads are the fallback when no match exists or mapping fails.
+            if args.shortread_dir:
+                sr = find_shortreads_for_sample(args.shortread_dir, s["sample"])
+                if sr["interleaved"] or sr["r1"]:
+                    bam_out = f"{args.output}_{s['sample']}.short.sorted.bam"
+                    mapped = map_shortreads(
+                        assembly_fasta = s["fasta"],
+                        output_bam     = bam_out,
+                        interleaved    = sr["interleaved"],
+                        r1             = sr["r1"],
+                        r2             = sr["r2"],
+                        threads        = args.shortread_threads,
+                    )
+                    if mapped:
+                        sample_args.bam = mapped
+                        _src_desc = sr["interleaved"] or f"{sr['r1']} / {sr['r2']}"
+                        print(f"[INFO] Short reads matched for {s['sample']} "
+                              f"({_src_desc}); used in priority over long reads.")
+                    else:
+                        print(f"[WARN] Short-read mapping failed for {s['sample']}; "
+                              f"falling back to long reads if available.", file=sys.stderr)
+
+            if not sample_args.bam and s["longread_fastq"]:
                 bam_out = f"{args.output}_{s['sample']}.sorted.bam"
                 mapped = map_longreads(
                     fastq          = s["longread_fastq"],
@@ -3064,27 +3176,12 @@ def main():
         results = sorted(results, key=lambda x: x["evidence"]["score"]["total_score"], reverse=True)
 
     else:
-        # ── Auto-map long reads if --longread-fastq supplied ─────────────────
-        if args.longread_fastq:
-            if args.bam:
-                print("[WARN] Both --bam and --longread-fastq supplied; "
-                      "--bam takes precedence, skipping mapping.", file=sys.stderr)
-            else:
-                bam_out = f"{args.output}.sorted.bam"
-                mapped = map_longreads(
-                    fastq          = args.longread_fastq,
-                    assembly_fasta = args.input,
-                    output_bam     = bam_out,
-                    preset         = args.longread_preset,
-                    threads        = args.longread_threads,
-                )
-                if mapped:
-                    args.bam = mapped
-                else:
-                    print("[WARN] Long-read mapping failed; continuing without BAM.",
-                          file=sys.stderr)
-
-        # ── Auto-map short reads if --shortread-fastq / --shortread-r1/r2 given
+        # ── Auto-map short reads if --shortread-fastq / --shortread-r1/r2 given ──
+        # Short reads take priority (cleaner coverage-drop signal — Illumina
+        # adapter ligation is blocked outright by a hairpin fold, vs. ONT's more
+        # variable mappability reduction across the palindrome), so they're
+        # mapped first; --longread-fastq is only auto-mapped as a fallback if
+        # this doesn't produce a BAM. An explicit --bam always wins over both.
         if _sr_interleaved or _sr_r1:
             if args.bam:
                 print("[WARN] --bam already set; skipping short-read mapping "
@@ -3102,7 +3199,28 @@ def main():
                 if mapped:
                     args.bam = mapped
                 else:
-                    print("[WARN] Short-read mapping failed; continuing without BAM.",
+                    print("[WARN] Short-read mapping failed; falling back to "
+                          "long reads if available.", file=sys.stderr)
+
+        # ── Auto-map long reads if --longread-fastq supplied (fallback) ──────────
+        if args.longread_fastq:
+            if args.bam:
+                print("[WARN] BAM already set (--bam or short-read mapping); "
+                      "--longread-fastq skipped (short reads take priority).",
+                      file=sys.stderr)
+            else:
+                bam_out = f"{args.output}.sorted.bam"
+                mapped = map_longreads(
+                    fastq          = args.longread_fastq,
+                    assembly_fasta = args.input,
+                    output_bam     = bam_out,
+                    preset         = args.longread_preset,
+                    threads        = args.longread_threads,
+                )
+                if mapped:
+                    args.bam = mapped
+                else:
+                    print("[WARN] Long-read mapping failed; continuing without BAM.",
                           file=sys.stderr)
 
         results = run_single_assembly(args)
