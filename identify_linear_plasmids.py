@@ -1294,6 +1294,136 @@ def screen_genes(annot_df: pd.DataFrame, contig_id: str) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# MODULE 5a: pELF2 tra (CONJUGATION) OPERON SCREENING
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# The 12-gene tra operon (orf1-orf12) reported in Table 1 of Nishimura et al.
+# 2026, PLOS Pathogens (10.1371/journal.ppat.1013937), "Identification of
+# essential genes for conjugative transfer in antimicrobial resistance-
+# associated pELF-type linear plasmids of opportunistic pathogen Enterococcus
+# faecium" — locus tags EfmKUHS13_31119-31138 in the pELF2 reference. Three
+# genes were experimentally shown essential for conjugative transfer and
+# named accordingly: orf3=traC (VirB4-like ATPase motor, functional analogy
+# only, not demonstrated orthology), orf4=traD (FtsK/VirD4-type ATPase, the
+# type IV coupling protein / T4CP), orf8=traG (rhomboid-family intramembrane
+# serine protease, VirB6-like). The remaining orfs were non-essential by
+# deletion (orf5/6/7/9/10/12), not assessed because no deletion mutant could
+# be built (orf1/2/11), or lack any recognisable domain at all.
+#
+# Detection is necessarily approximate: the paper's own conclusion is that
+# "most genes showed no similarity to the conventional plasmid conjugation
+# genes" — half of the 12 orfs have no identifiable Pfam/InterPro domain, so
+# a Prokka/Bakta annotation has nothing distinctive to name them with. Only
+# the genes with a reported domain get a keyword here; the rest are listed
+# in TRA_OPERON_GENES for completeness (visible in JSON) but are never
+# matched. Word-boundary matching only, same convention as screen_genes(),
+# to avoid substring false positives (e.g. bare "transposase" is deliberately
+# NOT used for orf7 — far too generic; only the specific Tc3-like mention is).
+#
+# Informational only — NOT scored (see SCORING_WEIGHTS: no tra_operon entry).
+# Reported in TSV (`tra_operon_hits`, `tra_operon_essential`) and JSON
+# (evidence["tra_operon"]) so a completed operon can be reviewed by eye
+# alongside the rest of the evidence, without influencing the confidence call.
+TRA_OPERON_GENES = [
+    {"orf": "orf1",  "gene": None,   "essential": None,
+     "note": "nonspecific endonuclease domain; deletion mutant could not be constructed",
+     "keywords": ["nonspecific endonuclease"]},
+    {"orf": "orf2",  "gene": None,   "essential": None,
+     "note": "no recognisable domain; role not assessed",
+     "keywords": []},
+    {"orf": "orf3",  "gene": "traC", "essential": True,
+     "note": "essential; VirB4-like ATPase motor (functional analogy only)",
+     "keywords": ["trac"]},
+    {"orf": "orf4",  "gene": "traD", "essential": True,
+     "note": "essential; FtsK/VirD4-type ATPase, type IV coupling protein (T4CP)",
+     "keywords": ["trad", "vird4", "type iv coupling protein", "t4cp"]},
+    {"orf": "orf5",  "gene": None,   "essential": False,
+     "note": "no recognisable domain; deletion had no effect on conjugation",
+     "keywords": []},
+    {"orf": "orf6",  "gene": None,   "essential": False,
+     "note": "no recognisable domain; deletion had no effect on conjugation",
+     "keywords": []},
+    {"orf": "orf7",  "gene": None,   "essential": False,
+     "note": "DNA-binding domain similar to Tc3 transposase; overlaps orf8; deletion had no effect",
+     "keywords": ["tc3 transposase", "tc3-like transposase"]},
+    {"orf": "orf8",  "gene": "traG", "essential": True,
+     "note": "essential; rhomboid-family intramembrane serine protease, VirB6-like",
+     "keywords": ["trag", "virb6", "rhomboid"]},
+    {"orf": "orf9",  "gene": None,   "essential": False,
+     "note": "no recognisable domain; deletion had no effect on conjugation",
+     "keywords": []},
+    {"orf": "orf10", "gene": None,   "essential": False,
+     "note": "transmembrane domain(s) only, no recognisable domain; deletion had no effect",
+     "keywords": []},
+    {"orf": "orf11", "gene": None,   "essential": None,
+     "note": "small protein with a DNA-binding motif; deletion mutant could not be constructed",
+     "keywords": ["dna-binding motif"]},
+    {"orf": "orf12", "gene": None,   "essential": False,
+     "note": "no recognisable domain; low phylogenetic conservation; not a core Tra component",
+     "keywords": []},
+]
+
+
+def detect_tra_operon(annot_df: pd.DataFrame, contig_id: str) -> dict:
+    """
+    Screen annotation for the pELF2 tra (conjugation) operon genes (see
+    TRA_OPERON_GENES). Same contig-matching/fallback logic as screen_genes().
+
+    Returns dict:
+      available          : bool
+      hits                : [{"orf", "gene", "essential", "note"}, ...] for
+                            each TRA_OPERON_GENES entry whose keyword(s)
+                            matched
+      n_hits              : len(hits)
+      n_essential_hits    : count of hits with essential=True (of 3 possible:
+                            traC/traD/traG)
+      annotation_mismatch : True if a multi-contig annotation couldn't be
+                            matched to this contig (same caveat as screen_genes)
+    """
+    if annot_df.empty:
+        return {"available": False}
+
+    for col in ("contig", "gene", "product"):
+        if col not in annot_df.columns:
+            annot_df = annot_df.copy()
+            annot_df[col] = ""
+
+    contig_col = annot_df["contig"].astype(str)
+    n_unique_contigs = contig_col.nunique()
+    subset = annot_df[contig_col.str.contains(
+        re.escape(str(contig_id)), na=False, case=False)]
+
+    if subset.empty and not annot_df.empty:
+        if n_unique_contigs <= 1:
+            subset = annot_df
+        else:
+            return {"available": True, "annotation_mismatch": True,
+                    "hits": [], "n_hits": 0, "n_essential_hits": 0}
+
+    all_genes    = subset["gene"].fillna("").astype(str).str.lower().tolist()
+    all_products = subset["product"].fillna("").astype(str).str.lower().tolist()
+    all_text     = all_genes + all_products
+
+    def _word_match(keyword, texts):
+        pat = r'(?<![a-z0-9])' + re.escape(keyword.lower()) + r'(?![a-z0-9])'
+        return any(re.search(pat, t) for t in texts)
+
+    hits = []
+    for entry in TRA_OPERON_GENES:
+        if any(_word_match(kw, all_text) for kw in entry["keywords"]):
+            hits.append({"orf": entry["orf"], "gene": entry["gene"],
+                        "essential": entry["essential"], "note": entry["note"]})
+
+    return {
+        "available":           True,
+        "annotation_mismatch": False,
+        "hits":                hits,
+        "n_hits":              len(hits),
+        "n_essential_hits":    sum(1 for h in hits if h["essential"] is True),
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # MODULE 5b: AMRFINDERPLUS SCREENING (antimicrobial resistance genes)
 # ─────────────────────────────────────────────────────────────────────────────
 #
@@ -2873,6 +3003,9 @@ def analyse_contig(record, args, annot_df, gfa_topology, ref_gc=None,
     # Gene content
     evidence["genes"] = screen_genes(annot_df, cid) if not annot_df.empty else {}
 
+    # tra (conjugation) operon (informational only — not scored, see module comment)
+    evidence["tra_operon"] = detect_tra_operon(annot_df, cid) if not annot_df.empty else {"available": False}
+
     # AMRFinderPlus hits (informational only — not scored, see module comment)
     evidence["amr"] = interpret_amr_hits(amr_df, cid)
 
@@ -3450,6 +3583,11 @@ def main():
             "amr_hit_count":     ev.get("amr", {}).get("hits", ""),
             "amr_genes":         "|".join(ev.get("amr", {}).get("genes", [])),
             "amr_classes":       "|".join(ev.get("amr", {}).get("classes", [])),
+            "tra_operon_hits":   "|".join(
+                                     f"{h['orf']}"+(f"/{h['gene']}" if h["gene"] else "")
+                                     for h in ev.get("tra_operon", {}).get("hits", [])),
+            "tra_operon_n":      ev.get("tra_operon", {}).get("n_hits", ""),
+            "tra_operon_essential_n": ev.get("tra_operon", {}).get("n_essential_hits", ""),
             "blast_hit":         ev.get("blast", {}).get("linear_plasmid_db_hit", False)
                                  or ev.get("blast", {}).get("linear_plasmid_hit", False),
             "blast_top_hit":     ev.get("blast", {}).get("top_hit", ""),
