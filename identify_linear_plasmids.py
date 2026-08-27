@@ -1297,7 +1297,7 @@ def screen_genes(annot_df: pd.DataFrame, contig_id: str) -> dict:
 # MODULE 5a: pELF2 tra (CONJUGATION) OPERON SCREENING
 # ─────────────────────────────────────────────────────────────────────────────
 #
-# The 12-gene tra operon (orf1-orf12) reported in Table 1 of Nishimura et al.
+# The 12-gene tra operon (orf1-orf12) reported in Table 1 of Kurushima et al.
 # 2026, PLOS Pathogens (10.1371/journal.ppat.1013937), "Identification of
 # essential genes for conjugative transfer in antimicrobial resistance-
 # associated pELF-type linear plasmids of opportunistic pathogen Enterococcus
