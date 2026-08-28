@@ -1,5 +1,9 @@
 # identify-linear-plasmids
 
+<p align="center">
+  <img src="logo/logo-ILP.png" alt="identify-linear-plasmids logo" width="600">
+</p>
+
 A multi-evidence scoring pipeline for identifying **linear plasmids** in
 bacterial genome assemblies — in particular pELF1-type linear plasmids
 (asymmetric hairpin/invertron ends), as described in:
