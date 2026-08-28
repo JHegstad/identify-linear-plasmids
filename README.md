@@ -1,5 +1,3 @@
-# identify-linear-plasmids
-
 <p align="center">
   <img src="logo/logo-ILP.png" alt="identify-linear-plasmids logo" width="600">
 </p>
